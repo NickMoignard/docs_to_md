@@ -26,6 +26,14 @@ for the rationale and rejected alternatives.
 If you add a file that *users* should receive, add its path to the `WHITELIST` in the
 publish skill. If you don't, it stays on development forever and never ships.
 
+## Merged contributor PRs must be ported back to development
+
+Outside contributors fork and open PRs against **master** (they never see development).
+When you merge such a PR, the change lives only on master — and the next
+`/publish-to-master` rebuilds master from development and would **revert it**. So after
+merging any PR into master, port the same change into `development` (cherry-pick or
+re-apply it) before the next publish. development is the source of truth.
+
 ## Updating CLAUDE.md
 
 `CLAUDE.md` is development-only and is never published. Update it (on development) whenever

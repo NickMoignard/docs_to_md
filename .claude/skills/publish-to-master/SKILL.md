@@ -23,6 +23,7 @@ SKILL.md
 crawl.py
 README.md
 CONTEXT.md
+CONTRIBUTING.md
 LICENSE
 pyproject.toml
 uv.lock
@@ -55,7 +56,7 @@ git switch master
 # untracked dev-only files still sitting on disk from development and leak them.
 git read-tree --empty
 git checkout development -- \
-  SKILL.md crawl.py README.md CONTEXT.md LICENSE \
+  SKILL.md crawl.py README.md CONTEXT.md CONTRIBUTING.md LICENSE \
   pyproject.toml uv.lock .tool-versions .gitignore docs/adr tests
 ```
 
