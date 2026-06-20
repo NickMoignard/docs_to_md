@@ -192,7 +192,7 @@ def derive_crawl_scope(entry_url: str) -> tuple[str, str]:
     (or "/" for root). Pages outside this host+prefix are not fetched.
     """
     parsed = urlparse(entry_url)
-    path = parsed.path if parsed.path else "/"
+    path = parsed.path.rstrip("/") or "/"
     return (parsed.netloc, path)
 
 
