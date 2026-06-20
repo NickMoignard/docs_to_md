@@ -301,6 +301,15 @@ class TestDeriveCrawlScope:
             "/payments/charges",
         )
 
+    def test_trailing_slash_stripped(self):
+        assert derive_crawl_scope("https://surrealdb.com/docs/") == ("surrealdb.com", "/docs")
+
+    def test_path_trailing_slash_stripped(self):
+        assert derive_crawl_scope("https://docs.stripe.com/payments/") == (
+            "docs.stripe.com",
+            "/payments",
+        )
+
 
 class TestIsInScope:
     def test_child_url_in_scope(self):
