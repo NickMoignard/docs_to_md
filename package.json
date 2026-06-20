@@ -1,0 +1,29 @@
+{
+  "name": "docs_to_md",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "uv run --extra dev pytest tests/ -v",
+    "typecheck": "echo 'Python project — no TypeScript to typecheck'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NickMoignard/docs_to_md.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/NickMoignard/docs_to_md/issues"
+  },
+  "homepage": "https://github.com/NickMoignard/docs_to_md#readme",
+  "dependencies": {
+    "@ai-hero/sandcastle": "^0.10.0",
+    "zod": "^4.4.3"
+  }
+}
