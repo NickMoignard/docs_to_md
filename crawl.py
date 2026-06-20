@@ -244,6 +244,28 @@ def fetch_sitemap_urls(entry_url: str, scope: tuple[str, str]) -> list[str] | No
         response.raise_for_status()
         root = ET.fromstring(response.text)
         ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+        # A <sitemapindex> points to sub-sitemaps, not pages — follow each one
+        # and collect the in-scope page URLs they contain.
+        if root.findall("sm:sitemap", ns):
+            all_urls: list[str] = []
+            for loc_el in root.findall(".//sm:loc", ns):
+                if not loc_el.text:
+                    continue
+                try:
+                    sub = requests.get(loc_el.text.strip(), headers=_HEADERS, timeout=30)
+                    sub.raise_for_status()
+                    sub_root = ET.fromstring(sub.text)
+                    all_urls.extend(
+                        loc.text.strip()
+                        for loc in sub_root.findall(".//sm:loc", ns)
+                        if loc.text and is_in_scope(loc.text.strip(), scope)
+                    )
+                except (requests.RequestException, ET.ParseError):
+                    continue
+            return all_urls if all_urls else None
+
+        # A <urlset> lists page URLs directly.
         urls = [
             loc.text.strip()
             for loc in root.findall(".//sm:loc", ns)
