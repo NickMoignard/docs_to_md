@@ -403,6 +403,71 @@ class TestFetchSitemapUrls:
         assert "https://docs.stripe.com/payments/charges" in urls
         assert "https://stripe.com/other" not in urls
 
+    SITEMAP_INDEX_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <sitemap><loc>https://surrealdb.com/sitemap-0.xml</loc></sitemap>
+    <sitemap><loc>https://surrealdb.com/docs/sitemap.xml</loc></sitemap>
+</sitemapindex>"""
+
+    SITEMAP_ROOT_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url><loc>https://surrealdb.com/</loc></url>
+    <url><loc>https://surrealdb.com/features</loc></url>
+</urlset>"""
+
+    SITEMAP_DOCS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url><loc>https://surrealdb.com/docs/surrealql</loc></url>
+    <url><loc>https://surrealdb.com/docs/surrealdb</loc></url>
+</urlset>"""
+
+    def test_follows_sitemap_index_and_returns_in_scope_pages(self):
+        scope = ("surrealdb.com", "/docs")
+
+        def fake_get(url, **kwargs):
+            mock_resp = MagicMock()
+            mock_resp.raise_for_status = MagicMock()
+            if url.endswith("/docs/sitemap.xml"):
+                mock_resp.text = self.SITEMAP_DOCS_XML
+            elif url.endswith("/sitemap-0.xml"):
+                mock_resp.text = self.SITEMAP_ROOT_XML
+            else:
+                mock_resp.text = self.SITEMAP_INDEX_XML
+            return mock_resp
+
+        with patch("crawl.requests.get", side_effect=fake_get):
+            urls = fetch_sitemap_urls("https://surrealdb.com/docs/", scope)
+
+        # Sub-sitemaps are followed; only in-scope (/docs) pages are returned,
+        # and the sitemap XML URLs themselves are never returned as pages.
+        assert urls == [
+            "https://surrealdb.com/docs/surrealql",
+            "https://surrealdb.com/docs/surrealdb",
+        ]
+        assert "https://surrealdb.com/docs/sitemap.xml" not in urls
+
+    def test_sitemap_index_skips_unfetchable_sub_sitemaps(self):
+        scope = ("surrealdb.com", "/docs")
+
+        def fake_get(url, **kwargs):
+            mock_resp = MagicMock()
+            mock_resp.raise_for_status = MagicMock()
+            if url.endswith("/docs/sitemap.xml"):
+                mock_resp.text = self.SITEMAP_DOCS_XML
+            elif url.endswith("/sitemap-0.xml"):
+                raise requests.ConnectionError()
+            else:
+                mock_resp.text = self.SITEMAP_INDEX_XML
+            return mock_resp
+
+        with patch("crawl.requests.get", side_effect=fake_get):
+            urls = fetch_sitemap_urls("https://surrealdb.com/docs/", scope)
+
+        assert urls == [
+            "https://surrealdb.com/docs/surrealql",
+            "https://surrealdb.com/docs/surrealdb",
+        ]
+
     def test_returns_none_on_http_error(self):
         with patch("crawl.requests.get") as mock_get:
             mock_get.side_effect = requests.HTTPError()
