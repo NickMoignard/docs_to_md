@@ -1,0 +1,7 @@
+# docs-to-md:rgignore start
+/docs/tools/**
+!/docs/tools/**/
+!/docs/tools/CONTEXT-MAP.md
+!/docs/tools/*/_index.md
+!/docs/tools/*/CONTEXT.md
+# docs-to-md:rgignore end

@@ -64,15 +64,69 @@ Present the derived values and ask for confirmation **exactly once**:
 >
 > Reply **yes** (or press Enter) to proceed, **no** to cancel, or type a replacement tool_name.
 
-- **yes / blank** → proceed to step 4 with the derived tool_name.
+- **yes / blank** → proceed with the derived tool_name (step 4, then crawl).
 - **no** → stop; do not crawl.
-- **<alternative name>** → use `--tool-name <alternative>` in step 4 and confirm once more.
+- **<alternative name>** → use `--tool-name <alternative>` at crawl time (step 5) and confirm once more.
 
 Do **not** prompt again after this confirmation.
 
-### 4. Crawl
+### 4. Configure the repo for ripgrep (idempotent)
 
-Once confirmed, run the full crawl autonomously:
+After the user confirms (step 3) and **before** crawling, set up the calling repo so agents
+grep cleanly. All three checks are idempotent — re-running changes nothing once in place. A
+cancelled crawl never reaches this step, so the repo is left untouched.
+
+**a. Check ripgrep is installed.** Warn and continue — do not auto-install, do not abort
+(the crawl does not need `rg`; the files below are inert until it is installed):
+
+```bash
+command -v rg >/dev/null || echo "WARNING: ripgrep (rg) not installed; the .rgignore and AGENTS.md guidance will take effect once you install it (e.g. 'brew install ripgrep' or 'apt install ripgrep'). Continuing." >&2
+```
+
+**b. Ensure the `.rgignore` block at the repo root.** Hides the bulk mirrored Pages from
+ripgrep while keeping the navigation layer (`CONTEXT-MAP.md`, each Tool's `_index.md` and
+`CONTEXT.md`) greppable. Append only if the marker is absent:
+
+```bash
+if ! grep -q "docs-to-md:rgignore" .rgignore 2>/dev/null; then
+  cat >> .rgignore <<'EOF'
+# docs-to-md:rgignore start
+/docs/tools/**
+!/docs/tools/**/
+!/docs/tools/CONTEXT-MAP.md
+!/docs/tools/*/_index.md
+!/docs/tools/*/CONTEXT.md
+# docs-to-md:rgignore end
+EOF
+fi
+```
+
+**c. Ensure the agent-instruction block.** Prefer an existing `AGENTS.md`; else an existing
+`CLAUDE.md`; else create `AGENTS.md`. Never write to `CONTEXT.md` (it is a glossary).
+Append only if the marker is absent:
+
+```bash
+if [ -f AGENTS.md ]; then TARGET=AGENTS.md
+elif [ -f CLAUDE.md ]; then TARGET=CLAUDE.md
+else TARGET=AGENTS.md
+fi
+if ! grep -q "docs-to-md:rg-policy" "$TARGET" 2>/dev/null; then
+  cat >> "$TARGET" <<'EOF'
+
+<!-- docs-to-md:rg-policy start -->
+## Searching the codebase
+
+- Use ripgrep (`rg`) for all searches. **Do not use `grep`** — `rg` is faster and respects ignore files.
+- Mirrored Tool docs under `docs/tools/` are hidden from `rg` by default (via `.rgignore`) to keep code searches low-noise. The navigation layer stays searchable: `docs/tools/CONTEXT-MAP.md`, and each Tool's `_index.md` and `CONTEXT.md`.
+- To search *inside* the mirrored docs, add `--no-ignore-dot`, e.g. `rg --no-ignore-dot "webhook signing" docs/tools/`. (Reveals the docs while still skipping `node_modules/`, `.venv/`, etc.)
+<!-- docs-to-md:rg-policy end -->
+EOF
+fi
+```
+
+### 5. Crawl
+
+Once configured, run the full crawl autonomously:
 
 ```bash
 uv run "$CRAWLER" <url> [--tool-name <confirmed_tool_name>] [--fresh]
@@ -80,7 +134,7 @@ uv run "$CRAWLER" <url> [--tool-name <confirmed_tool_name>] [--fresh]
 
 The crawler writes markdown to `docs/tools/<tool_name>/` relative to the current working directory (the calling repo's root).
 
-### 5. Report
+### 6. Report
 
 After crawling completes, print a brief summary:
 

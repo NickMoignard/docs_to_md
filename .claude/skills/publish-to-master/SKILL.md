@@ -29,6 +29,7 @@ pyproject.toml
 uv.lock
 .tool-versions
 .gitignore
+.rgignore
 docs/adr/
 tests/
 ```
@@ -57,7 +58,7 @@ git switch master
 git read-tree --empty
 git checkout development -- \
   SKILL.md crawl.py README.md CONTEXT.md CONTRIBUTING.md LICENSE \
-  pyproject.toml uv.lock .tool-versions .gitignore docs/adr tests
+  pyproject.toml uv.lock .tool-versions .gitignore .rgignore docs/adr tests
 ```
 
 > Add a path here (and to "The whitelist" above) whenever a new **public** file is
