@@ -89,7 +89,7 @@ ripgrep while keeping the navigation layer (`CONTEXT-MAP.md`, each Tool's `_inde
 
 ```bash
 if ! grep -q "docs-to-md:rgignore" .rgignore 2>/dev/null; then
-  cat >> .rgignore <<'EOF'
+  command cat >> .rgignore <<'EOF'
 # docs-to-md:rgignore start
 /docs/tools/**
 !/docs/tools/**/
@@ -111,7 +111,7 @@ elif [ -f CLAUDE.md ]; then TARGET=CLAUDE.md
 else TARGET=AGENTS.md
 fi
 if ! grep -q "docs-to-md:rg-policy" "$TARGET" 2>/dev/null; then
-  cat >> "$TARGET" <<'EOF'
+  command cat >> "$TARGET" <<'EOF'
 
 <!-- docs-to-md:rg-policy start -->
 ## Searching the codebase

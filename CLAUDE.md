@@ -18,7 +18,7 @@ published to the public `master` branch.**
 ## What ships (public whitelist)
 
 `SKILL.md`, `crawl.py`, `README.md`, `CONTEXT.md`, `docs/adr/`, `tests/`,
-`pyproject.toml`, `uv.lock`, `.tool-versions`, `.gitignore`, `LICENSE`.
+`pyproject.toml`, `uv.lock`, `.tool-versions`, `.gitignore`, `.rgignore`, `LICENSE`.
 
 Everything else is development-only.
 
