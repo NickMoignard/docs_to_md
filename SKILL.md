@@ -129,8 +129,15 @@ fi
 Once configured, run the full crawl autonomously:
 
 ```bash
-uv run "$CRAWLER" <url> [--tool-name <confirmed_tool_name>] [--fresh]
+uv run "$CRAWLER" <url> [--tool-name <confirmed_tool_name>] [--fresh] --summarize --synthesize
 ```
+
+`--summarize` fills each Page's `summary` frontmatter via an LLM (one call per Page);
+`--synthesize` then writes the navigation layer the crawl is for: the per-Tool Glossary
+(`docs/tools/<tool_name>/CONTEXT.md`), the Page map with inline summaries
+(`docs/tools/<tool_name>/_index.md`), and the Tools map (`docs/tools/CONTEXT-MAP.md`).
+Without these flags only the raw Page files are written and there is no navigation layer —
+which is what the `.rgignore` in step 4 keeps greppable, so they must run.
 
 The crawler writes markdown to `docs/tools/<tool_name>/` relative to the current working directory (the calling repo's root).
 
@@ -140,9 +147,12 @@ After crawling completes, print a brief summary:
 
 ```
 Crawled <N> pages → docs/tools/<tool_name>/
+  Page map:  docs/tools/<tool_name>/_index.md
+  Glossary:  docs/tools/<tool_name>/CONTEXT.md
+  Tools map: docs/tools/CONTEXT-MAP.md
 ```
 
-List any pages that were skipped (unchanged) if relevant.
+List any pages that were skipped (unchanged) or failed to summarize if relevant.
 
 ## Installation
 
