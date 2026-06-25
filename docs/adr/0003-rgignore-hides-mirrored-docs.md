@@ -2,7 +2,7 @@
 
 The whole point of the crawler is to put a Tool's docs in front of an agent — yet a full
 mirror is hundreds of Pages of prose that drown out code when an agent greps the repo. So
-`docs-to-md` configures the calling repo to **hide the mirrored docs from ripgrep by
+`docs-to-okf` configures the calling repo to **hide the mirrored docs from ripgrep by
 default** while keeping the high-signal **navigation layer** searchable, and tells the
 agent how to opt back in.
 
@@ -12,14 +12,15 @@ managed block to the repo-root `.rgignore`:
 ```
 /docs/tools/**
 !/docs/tools/**/
-!/docs/tools/CONTEXT-MAP.md
-!/docs/tools/*/_index.md
-!/docs/tools/*/CONTEXT.md
+!/docs/tools/**/index.md
+!/docs/tools/**/glossary.md
+!/docs/tools/**/log.md
 ```
 
-This hides the bulk Pages but keeps the **Tools map** (`CONTEXT-MAP.md`), each Tool's
-**Page map** (`_index.md`), and each Tool's **Glossary** (`CONTEXT.md`) greppable — so an
-agent can grep to discover *which* Tool documents a term, then dive in. To search inside
+This hides the bulk Pages but keeps the navigation layer greppable: each directory's
+progressive-disclosure `index.md` listing, each Tool's `glossary.md` and `log.md`, and the
+`docs/tools/index.md` bundles index — so an agent can grep to discover *which* bundle
+documents a term, then dive in. To search inside
 the bulk docs the agent uses `rg --no-ignore-dot`. A managed block is also added to the
 calling repo's `AGENTS.md` (or `CLAUDE.md`) instructing the agent to use `rg` over `grep`
 and documenting the opt-in flag.
@@ -34,6 +35,8 @@ and documenting the opt-in flag.
   tool we mean and nothing else.
 - **Hide all of `docs/tools/`** — simpler one-liner, but an agent can no longer grep to
   find the right entry Page; navigation files become reachable only by path.
+  This ADR is re-issued for the renamed OKF nav layer; it is **not** a reversal of the
+  hide-bulk-keep-nav decision.
 - **Hide bulk Pages, keep the nav layer** (chosen) — fiddlier negation pattern (a parent
   dir must be re-included before its files can be), but preserves cheap grep-to-route.
 - **Opt-in via `-u`/`--no-ignore`** — also un-hides `node_modules/`, `.venv/`, etc.,

@@ -1,5 +1,5 @@
 ---
-description: Publish the clean public subset of this repo from the development branch to master. Copies only a whitelist of files (skill + crawler + public docs) onto master so scaffolding never leaks. Use when releasing docs-to-md changes to the public master branch.
+description: Publish the clean public subset of this repo from the development branch to master. Copies only a whitelist of files (skill + crawler + public docs) onto master so scaffolding never leaks. Use when releasing docs-to-okf changes to the public master branch.
 ---
 
 # publish-to-master
@@ -32,6 +32,7 @@ uv.lock
 .rgignore
 docs/adr/
 tests/
+scripts/
 ```
 
 > `docs/adr/` holds **product** ADRs only. Dev-workflow ADRs live in `docs/agents/adr/`,
@@ -58,7 +59,7 @@ git switch master
 git read-tree --empty
 git checkout development -- \
   SKILL.md crawl.py README.md CONTEXT.md CONTRIBUTING.md LICENSE \
-  pyproject.toml uv.lock .tool-versions .gitignore .rgignore docs/adr tests
+  pyproject.toml uv.lock .tool-versions .gitignore .rgignore docs/adr tests scripts
 ```
 
 > Add a path here (and to "The whitelist" above) whenever a new **public** file is

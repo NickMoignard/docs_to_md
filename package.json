@@ -1,5 +1,5 @@
 {
-  "name": "docs_to_md",
+  "name": "docs_to_okf",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -12,16 +12,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NickMoignard/docs_to_md.git"
+    "url": "git+https://github.com/NickMoignard/docs_to_okf.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/NickMoignard/docs_to_md/issues"
+    "url": "https://github.com/NickMoignard/docs_to_okf/issues"
   },
-  "homepage": "https://github.com/NickMoignard/docs_to_md#readme",
+  "homepage": "https://github.com/NickMoignard/docs_to_okf#readme",
   "dependencies": {
     "@ai-hero/sandcastle": "^0.10.0",
     "zod": "^4.4.3"

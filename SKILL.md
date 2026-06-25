@@ -1,15 +1,15 @@
 ---
-description: Mirror a Tool's documentation site to markdown. Confirms tool_name and crawl scope with the user once, then crawls the full site into docs/tools/<tool_name>/ without further prompting.
+description: Mirror a Tool's docs into an OKF v0.1 Knowledge Bundle. Confirms tool_name and crawl scope with the user once, then crawls the full site into docs/tools/<tool_name>/ without further prompting.
 ---
 
-# docs-to-md
+# docs-to-okf
 
-Crawl a Tool's documentation website and write every in-scope page as markdown into the calling repo's `docs/tools/<tool_name>/` directory.
+Crawl a Tool's documentation website and write every in-scope page as markdown into the calling repo's `docs/tools/<tool_name>/` directory, structured as an OKF v0.1 Knowledge Bundle.
 
 ## Invocation
 
 ```
-/docs-to-md <url> [--tool-name <override>] [--fresh]
+/docs-to-okf <url> [--tool-name <override>] [--fresh]
 ```
 
 - `<url>` — the entry URL of the Tool's documentation site (required)
@@ -24,15 +24,15 @@ Crawl a Tool's documentation website and write every in-scope page as markdown i
 
 ```bash
 # Per-repo install
-SKILL_DIR=".claude/skills/docs-to-md"
+SKILL_DIR=".claude/skills/docs-to-okf"
 # Global install
-# SKILL_DIR="$HOME/.claude/skills/docs-to-md"
+# SKILL_DIR="$HOME/.claude/skills/docs-to-okf"
 
 # Auto-detect: prefer local, fall back to global
-if [ -f ".claude/skills/docs-to-md/crawl.py" ]; then
-  SKILL_DIR=".claude/skills/docs-to-md"
-elif [ -f "$HOME/.claude/skills/docs-to-md/crawl.py" ]; then
-  SKILL_DIR="$HOME/.claude/skills/docs-to-md"
+if [ -f ".claude/skills/docs-to-okf/crawl.py" ]; then
+  SKILL_DIR=".claude/skills/docs-to-okf"
+elif [ -f "$HOME/.claude/skills/docs-to-okf/crawl.py" ]; then
+  SKILL_DIR="$HOME/.claude/skills/docs-to-okf"
 else
   echo "ERROR: crawl.py not found. Re-install the skill." >&2
   exit 1
@@ -83,20 +83,20 @@ cancelled crawl never reaches this step, so the repo is left untouched.
 command -v rg >/dev/null || echo "WARNING: ripgrep (rg) not installed; the .rgignore and AGENTS.md guidance will take effect once you install it (e.g. 'brew install ripgrep' or 'apt install ripgrep'). Continuing." >&2
 ```
 
-**b. Ensure the `.rgignore` block at the repo root.** Hides the bulk mirrored Pages from
-ripgrep while keeping the navigation layer (`CONTEXT-MAP.md`, each Tool's `_index.md` and
-`CONTEXT.md`) greppable. Append only if the marker is absent:
+**b. Ensure the `.rgignore` block at the repo root.** Hides the bulk Concept pages from
+ripgrep while keeping the navigation layer (each directory's `index.md`, each Tool's
+`glossary.md` and `log.md`) greppable. Append only if the marker is absent:
 
 ```bash
-if ! grep -q "docs-to-md:rgignore" .rgignore 2>/dev/null; then
+if ! grep -q "docs-to-okf:rgignore" .rgignore 2>/dev/null; then
   command cat >> .rgignore <<'EOF'
-# docs-to-md:rgignore start
+# docs-to-okf:rgignore start
 /docs/tools/**
 !/docs/tools/**/
-!/docs/tools/CONTEXT-MAP.md
-!/docs/tools/*/_index.md
-!/docs/tools/*/CONTEXT.md
-# docs-to-md:rgignore end
+!/docs/tools/**/index.md
+!/docs/tools/**/glossary.md
+!/docs/tools/**/log.md
+# docs-to-okf:rgignore end
 EOF
 fi
 ```
@@ -110,16 +110,16 @@ if [ -f AGENTS.md ]; then TARGET=AGENTS.md
 elif [ -f CLAUDE.md ]; then TARGET=CLAUDE.md
 else TARGET=AGENTS.md
 fi
-if ! grep -q "docs-to-md:rg-policy" "$TARGET" 2>/dev/null; then
+if ! grep -q "docs-to-okf:rg-policy" "$TARGET" 2>/dev/null; then
   command cat >> "$TARGET" <<'EOF'
 
-<!-- docs-to-md:rg-policy start -->
+<!-- docs-to-okf:rg-policy start -->
 ## Searching the codebase
 
 - Use ripgrep (`rg`) for all searches. **Do not use `grep`** — `rg` is faster and respects ignore files.
-- Mirrored Tool docs under `docs/tools/` are hidden from `rg` by default (via `.rgignore`) to keep code searches low-noise. The navigation layer stays searchable: `docs/tools/CONTEXT-MAP.md`, and each Tool's `_index.md` and `CONTEXT.md`.
+- Mirrored Tool docs under `docs/tools/` are hidden from `rg` by default (via `.rgignore`) to keep code searches low-noise. The navigation layer stays searchable: each directory's `index.md`, each Tool's `glossary.md` and `log.md`, and the `docs/tools/index.md` bundles index.
 - To search *inside* the mirrored docs, add `--no-ignore-dot`, e.g. `rg --no-ignore-dot "webhook signing" docs/tools/`. (Reveals the docs while still skipping `node_modules/`, `.venv/`, etc.)
-<!-- docs-to-md:rg-policy end -->
+<!-- docs-to-okf:rg-policy end -->
 EOF
 fi
 ```
@@ -133,11 +133,12 @@ uv run "$CRAWLER" <url> [--tool-name <confirmed_tool_name>] [--fresh] --summariz
 ```
 
 `--summarize` fills each Page's `summary` frontmatter via an LLM (one call per Page);
-`--synthesize` then writes the navigation layer the crawl is for: the per-Tool Glossary
-(`docs/tools/<tool_name>/CONTEXT.md`), the Page map with inline summaries
-(`docs/tools/<tool_name>/_index.md`), and the Tools map (`docs/tools/CONTEXT-MAP.md`).
-Without these flags only the raw Page files are written and there is no navigation layer —
-which is what the `.rgignore` in step 4 keeps greppable, so they must run.
+`--synthesize` then writes the OKF navigation layer the crawl is for: a per-directory
+progressive-disclosure listing (`index.md`) in every directory, the per-Tool Glossary
+(`docs/tools/<tool_name>/glossary.md`), the per-Tool Log (`docs/tools/<tool_name>/log.md`),
+and the bundles listing (`docs/tools/index.md`). Without these flags only the raw Page
+files are written and there is no navigation layer — which is what the `.rgignore` in
+step 4 keeps greppable, so they must run.
 
 The crawler writes markdown to `docs/tools/<tool_name>/` relative to the current working directory (the calling repo's root).
 
@@ -147,30 +148,37 @@ After crawling completes, print a brief summary:
 
 ```
 Crawled <N> pages → docs/tools/<tool_name>/
-  Page map:  docs/tools/<tool_name>/_index.md
-  Glossary:  docs/tools/<tool_name>/CONTEXT.md
-  Tools map: docs/tools/CONTEXT-MAP.md
+  Dir listings: per-directory index.md (progressive disclosure)
+  Glossary:     docs/tools/<tool_name>/glossary.md
+  Log:          docs/tools/<tool_name>/log.md
+  Bundles:      docs/tools/index.md
+  OKF: bundle validated — conformant with OKF v0.1
 ```
 
 List any pages that were skipped (unchanged) or failed to summarize if relevant.
 
 ## Installation
 
-Copy both `SKILL.md` and `crawl.py` from this repo into the calling repo or your global Claude skills directory.
+The skill is three files that travel together: `SKILL.md`, `crawl.py`, and
+`scripts/validate.sh` (the crawler locates the validator at `scripts/validate.sh` next to
+itself). Copy all three from this repo into the calling repo or your global Claude skills
+directory. The installed layout is `.claude/skills/docs-to-okf/{SKILL.md,crawl.py,scripts/validate.sh}`.
 
 **Per-repo** (available only in this repo):
 ```bash
-mkdir -p .claude/skills/docs-to-md
-cp /path/to/docs_to_md/{SKILL.md,crawl.py} .claude/skills/docs-to-md/
+mkdir -p .claude/skills/docs-to-okf/scripts
+cp /path/to/docs_to_okf/{SKILL.md,crawl.py} .claude/skills/docs-to-okf/
+cp /path/to/docs_to_okf/scripts/validate.sh .claude/skills/docs-to-okf/scripts/
 ```
 
 **Global** (available in any repo):
 ```bash
-mkdir -p ~/.claude/skills/docs-to-md
-cp /path/to/docs_to_md/{SKILL.md,crawl.py} ~/.claude/skills/docs-to-md/
+mkdir -p ~/.claude/skills/docs-to-okf/scripts
+cp /path/to/docs_to_okf/{SKILL.md,crawl.py} ~/.claude/skills/docs-to-okf/
+cp /path/to/docs_to_okf/scripts/validate.sh ~/.claude/skills/docs-to-okf/scripts/
 ```
 
 After installation, invoke with:
 ```
-/docs-to-md https://docs.example.com/
+/docs-to-okf https://docs.example.com/
 ```

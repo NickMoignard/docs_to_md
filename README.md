@@ -1,19 +1,24 @@
-# docs-to-md
+# docs-to-okf
 
 A Claude Code **skill** plus a Python **crawler** that mirror an external product's
-documentation website into local markdown, then summarise it for agent consumption.
+documentation website into an **OKF v0.1 Knowledge Bundle** — a tree of markdown
+**Concepts** with YAML frontmatter — and validate its conformance.
 
 Point it at a documentation site (e.g. `https://docs.stripe.com/payments`) and it
-crawls every in-scope page, converts each to a clean markdown file with provenance
-frontmatter, and (optionally) writes per-page summaries, a glossary, and a routing
-"page map" so a future agent can navigate the docs without opening hundreds of pages.
+crawls every in-scope page, converts each into a Concept (a clean markdown file with
+provenance frontmatter), builds the navigation layer (per-directory listings, a
+glossary, a change log, and a bundles index), and validates the result against the
+OKF spec so a future agent can navigate the docs without opening hundreds of pages.
 
-Output lands in the calling repo under `docs/tools/<tool_name>/`.
+Each crawled **Page** becomes one **Concept**. Output lands in the calling repo under
+`docs/tools/<tool_name>/`, where each `docs/tools/<tool_name>/` directory is an
+independently-validated **OKF Bundle**.
 
 > **Vocabulary note:** throughout this project, **Tool** (capital T) means *the
-> external product whose docs you are mirroring* (Stripe, React, …). **The skill**
-> and **the crawler** are the things in this repo. See [`CONTEXT.md`](CONTEXT.md)
-> for the full domain glossary.
+> external product whose docs you are mirroring* (Stripe, React, …). Each Tool's
+> mirror is an OKF **Bundle**; each crawled Page becomes a **Concept** (a markdown
+> file with YAML frontmatter). **The skill** and **the crawler** are the things in
+> this repo. See [`CONTEXT.md`](CONTEXT.md) for the full domain glossary.
 
 ---
 
@@ -23,18 +28,32 @@ For a Tool named `stripe`, in the calling repo:
 
 ```
 docs/tools/
-├── CONTEXT-MAP.md              # "Tools map": one line per Tool, auto-updated
+├── index.md                    # reserved listing of every bundle (frontmatter-free)
 └── stripe/
-    ├── _index.md               # "Page map": URL tree + one-line summaries
-    ├── CONTEXT.md              # "Glossary": auto-generated domain terms
-    ├── payments/
-    │   ├── index.md            # group-index page for /payments
-    │   └── accept-a-payment.md
-    └── ...                     # one .md file per crawled page
+    ├── index.md                # bundle-root listing; carries okf_version: "0.1"
+    ├── glossary.md             # type: Glossary — auto-generated domain terms
+    ├── log.md                  # dated change history for this bundle
+    ├── payments.md             # the /payments Page (a Concept)
+    └── payments/               # the /payments section (file-and-folder pattern)
+        ├── index.md            # reserved per-directory listing (frontmatter-free)
+        └── accept-a-payment.md # one .md Concept per crawled page
 ```
 
-Each page file carries YAML frontmatter (`title`, `source_url`, `nav_path`,
-`fetched_at`, `content_hash`, and — with `--summarize` — `summary` / `keywords`).
+A URL segment that is **both a page and a parent** uses the **file-and-folder**
+pattern — `payments.md` for the page next to a `payments/` directory for its children
+(never `payments/index.md`). The reserved `index.md` in each directory is a
+frontmatter-free progressive-disclosure listing; the bundle-root `index.md`
+additionally carries `okf_version: "0.1"`.
+
+Each Concept file carries YAML frontmatter:
+
+- `type` — the OKF Concept type (required; defaults to `Reference`).
+- `title` — the page title.
+- `description` — a short summary (written only with `--summarize`).
+- `resource` — the source URL the Concept was mirrored from.
+- `timestamp` — when it was fetched.
+- plus extension keys `keywords`, `content_hash`, and `nav_path`.
+
 In-scope links are rewritten to relative `.md` paths; images stay as absolute URLs
 (never downloaded).
 
@@ -55,15 +74,15 @@ for pages that need JavaScript rendering — no manual browser setup required.
 
 ## Installing the skill in another repo
 
-The skill is two files that live next to each other: **`SKILL.md`** and
-**`crawl.py`**. Clone this repo, then copy both into a `docs-to-md` skill directory.
-You can install it **per-repo** (available only in that repo) or **globally**
-(available in every repo).
+The skill is the crawler plus the bundled OKF validator: **`SKILL.md`**,
+**`crawl.py`**, and **`scripts/validate.sh`**. Clone this repo, then copy them into a
+`docs-to-okf` skill directory. You can install it **per-repo** (available only in that
+repo) or **globally** (available in every repo).
 
 First, clone this repo somewhere (once):
 
 ```bash
-git clone https://github.com/NickMoignard/docs_to_md.git /tmp/docs_to_md
+git clone https://github.com/NickMoignard/docs_to_okf.git /tmp/docs_to_okf
 ```
 
 ### Option A — per-repo install
@@ -71,21 +90,26 @@ git clone https://github.com/NickMoignard/docs_to_md.git /tmp/docs_to_md
 Run this from the root of the repo you want the skill in:
 
 ```bash
-mkdir -p .claude/skills/docs-to-md
-cp /tmp/docs_to_md/SKILL.md /tmp/docs_to_md/crawl.py \
-   .claude/skills/docs-to-md/
+mkdir -p .claude/skills/docs-to-okf/scripts
+cp /tmp/docs_to_okf/SKILL.md /tmp/docs_to_okf/crawl.py \
+   .claude/skills/docs-to-okf/
+cp /tmp/docs_to_okf/scripts/validate.sh \
+   .claude/skills/docs-to-okf/scripts/
 ```
 
-Commit `.claude/skills/docs-to-md/` so the whole team gets the skill.
+Commit `.claude/skills/docs-to-okf/` so the whole team gets the skill.
 
 ### Option B — global install
 
 ```bash
-mkdir -p ~/.claude/skills/docs-to-md
-cp /tmp/docs_to_md/SKILL.md /tmp/docs_to_md/crawl.py \
-   ~/.claude/skills/docs-to-md/
+mkdir -p ~/.claude/skills/docs-to-okf/scripts
+cp /tmp/docs_to_okf/SKILL.md /tmp/docs_to_okf/crawl.py \
+   ~/.claude/skills/docs-to-okf/
+cp /tmp/docs_to_okf/scripts/validate.sh \
+   ~/.claude/skills/docs-to-okf/scripts/
 ```
 
+The installed layout is `.claude/skills/docs-to-okf/{SKILL.md,crawl.py,scripts/validate.sh}`.
 The skill auto-detects which location it lives in (it prefers a per-repo copy and
 falls back to the global one), so both can coexist.
 
@@ -94,14 +118,14 @@ falls back to the global one), so both can coexist.
 In the target repo, start Claude Code and run:
 
 ```
-/docs-to-md https://docs.example.com/
+/docs-to-okf https://docs.example.com/
 ```
 
-If Claude lists `docs-to-md` among its skills and the command is recognised, you're
+If Claude lists `docs-to-okf` among its skills and the command is recognised, you're
 set. You can also smoke-test the crawler directly:
 
 ```bash
-uv run .claude/skills/docs-to-md/crawl.py https://docs.example.com/ --show-info
+uv run .claude/skills/docs-to-okf/crawl.py https://docs.example.com/ --show-info
 ```
 
 This prints the derived tool name and crawl scope as JSON without fetching anything.
@@ -113,7 +137,7 @@ This prints the derived tool name and crawl scope as JSON without fetching anyth
 Invoke it with the documentation entry URL:
 
 ```
-/docs-to-md <url> [--tool-name <override>] [--fresh]
+/docs-to-okf <url> [--tool-name <override>] [--fresh]
 ```
 
 What happens:
@@ -122,16 +146,17 @@ What happens:
    (same host + same path prefix as your URL) and shows it to you.
 2. **One confirmation.** It asks you to confirm *once*. Reply **yes** (or just press
    Enter) to proceed, **no** to cancel, or type a replacement tool name.
-3. **Crawl.** It then crawls the full in-scope site autonomously and writes markdown
-   to `docs/tools/<tool_name>/`.
-4. **Report.** It prints a summary, e.g. `Crawled 142 pages → docs/tools/stripe/`.
+3. **Crawl.** It then crawls the full in-scope site autonomously and writes the OKF
+   Bundle to `docs/tools/<tool_name>/`.
+4. **Validate & report.** It validates each bundle and prints a summary, e.g.
+   `Crawled 142 pages → docs/tools/stripe/`.
 
 Examples:
 
 ```
-/docs-to-md https://docs.stripe.com/payments
-/docs-to-md https://react.dev/learn --tool-name react
-/docs-to-md https://docs.stripe.com/payments --fresh
+/docs-to-okf https://docs.stripe.com/payments
+/docs-to-okf https://react.dev/learn --tool-name react
+/docs-to-okf https://docs.stripe.com/payments --fresh
 ```
 
 The **crawl scope** is what bounds the crawl: only pages on the same host and under
@@ -158,6 +183,7 @@ the repo you want the docs in before running.
 | Option | What it does |
 | --- | --- |
 | `--tool-name <name>` | Override the derived tool name (default: derived from URL host). |
+| `--type <type>` | OKF Concept type to stamp on each crawled page (default: `Reference`). |
 | `--show-info` | Print derived tool name + scope as JSON and exit (no fetching). |
 | `--single-page` | Crawl only the given URL, not the whole scope. |
 | `--fresh` | Wipe the Tool's cache and output, then re-crawl from scratch. |
@@ -167,10 +193,14 @@ the repo you want the docs in before running.
 | `--delay <seconds>` | Inter-request delay (a delay always applies, even by default). |
 | `--header 'K: V'` | Extra request header, repeatable (e.g. auth tokens). |
 | `--cookie 'name=value'` | Cookie to send, repeatable. |
-| `--summarize` | After crawling, write a per-page LLM summary into frontmatter. |
+| `--summarize` | After crawling, write a per-page LLM summary into `description`. |
 | `--summarize-concurrency <N>` | Max concurrent summary workers (default 6). |
 | `--summarize-batch-size <N>` | Pages per summary batch (default 15). |
-| `--synthesize` | Generate the glossary, page map, and tools map. |
+| `--synthesize` | Generate the glossary, per-directory listings, and bundles index. |
+| `--no-validate` | Skip the post-crawl OKF bundle validation. |
+
+Every crawl ends by validating each bundle with the bundled `scripts/validate.sh`,
+which **exits non-zero on conformance errors**. Pass `--no-validate` to skip it.
 
 ### Recipes
 
@@ -221,10 +251,12 @@ delay so sites aren't hammered. Pass `--safe-mode` to honour `robots.txt`.
 
 - `SKILL.md` — the Claude Code skill definition (orchestration + the one-time
   confirmation flow).
-- `crawl.py` — the crawler: discovery, fetch, HTML→markdown conversion, summary
-  fan-out, and synthesis.
-- `CONTEXT.md` — the project's domain glossary (definitions of Tool, Page, scope,
-  manifest, page map, glossary, etc.).
+- `crawl.py` — the crawler: discovery, fetch, HTML→Concept conversion, summary
+  fan-out, synthesis, and OKF validation.
+- `scripts/validate.sh` — the vendored OKF Bundle validator the crawler runs after
+  each crawl.
+- `CONTEXT.md` — the project's domain glossary (definitions of Tool, Bundle, Concept,
+  scope, manifest, glossary, etc.).
 - `docs/adr/` — architecture decision records.
 - `tests/` — the test suite (`uv run pytest`).
 
@@ -233,5 +265,3 @@ delay so sites aren't hammered. Pass `--safe-mode` to honour `robots.txt`.
 ## License
 
 [MIT](LICENSE) © 2026 Nick Moignard.
-</content>
-</invoke>
