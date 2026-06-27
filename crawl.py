@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
@@ -84,6 +85,137 @@ _CONTENT_SELECTORS = [
 ]
 
 _CONTENT_THRESHOLD = 200
+
+
+class Progress:
+    """Live progress reporter for a crawl run.
+
+    Writes to a stream (default ``sys.stderr``). When that stream is a TTY it
+    renders a single in-place line per item; otherwise it throttles to milestone
+    lines (~every 10% of items) so output captured by the skill/agent stays
+    compact. Failures are always printed in full, in both modes.
+
+    Construct one in ``main()`` and pass it into the library functions
+    (``crawl_site`` and friends). They stay silent when handed ``None`` — use the
+    shared ``_NULL_PROGRESS`` no-op so call sites need no guards. Thread-safe: all
+    rendering and counter updates happen under a lock, so the summarize worker
+    pool can report concurrently.
+    """
+
+    def __init__(self, stream=None, *, enabled: bool = True):
+        self._stream = sys.stderr if stream is None else stream
+        self.enabled = enabled
+        try:
+            self.is_tty = bool(self._stream.isatty())
+        except Exception:
+            self.is_tty = False
+        self._lock = threading.Lock()
+        self._active = False  # an unfinished in-place TTY line is on screen
+        self._label = ""
+        self._total = 0
+        self._count = 0
+        self._tally: dict[str, int] = defaultdict(int)
+        self._step = 1
+        self._last_emit = 0
+
+    def _clear_active(self) -> None:
+        """Erase a pending in-place TTY line. Caller must hold the lock."""
+        if self._active and self.is_tty:
+            self._stream.write("\r\x1b[K")
+            self._stream.flush()
+        self._active = False
+
+    def _summary(self) -> str:
+        return ", ".join(f"{n} {status}" for status, n in self._tally.items())
+
+    def banner(self, text: str) -> None:
+        """Emit a one-off phase banner line (e.g. 'Validating bundle…')."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clear_active()
+            print(text, file=self._stream, flush=True)
+
+    def start(self, label: str, total: int) -> None:
+        """Begin a counted phase, resetting counters and the milestone step."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clear_active()
+            self._label = label
+            self._total = total
+            self._count = 0
+            self._tally = defaultdict(int)
+            self._step = max(1, total // 10)
+            self._last_emit = 0
+            print(
+                f"{label}: {total} pages" if total else f"{label}…",
+                file=self._stream,
+                flush=True,
+            )
+
+    def begin(self, name: str) -> None:
+        """TTY-only: show the in-progress action before an item resolves."""
+        if not self.enabled or not self.is_tty:
+            return
+        with self._lock:
+            self._stream.write(f"\r\x1b[K  [{self._count}/{self._total}] {name}…")
+            self._stream.flush()
+            self._active = True
+
+    def item(self, status: str, name: str, detail: str | None = None) -> None:
+        """Report one completed item with its status (fetched/updated/skipped/FAILED)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._count += 1
+            self._tally[status] += 1
+            if status == "FAILED":
+                self._clear_active()
+                line = f"  FAILED {name}"
+                if detail:
+                    line += f": {detail}"
+                print(line, file=self._stream, flush=True)
+                return
+            if self.is_tty:
+                self._stream.write(
+                    f"\r\x1b[K  [{self._count}/{self._total}] {status} {name}"
+                )
+                self._stream.flush()
+                self._active = True
+            elif self._count - self._last_emit >= self._step or self._count == self._total:
+                self._last_emit = self._count
+                print(
+                    f"  [{self._count}/{self._total}] {self._summary()}",
+                    file=self._stream,
+                    flush=True,
+                )
+
+    def note(self, text: str) -> None:
+        """Heartbeat line for unknown-total phases (e.g. BFS discovery)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clear_active()
+            print(text, file=self._stream, flush=True)
+
+    def done(self, summary: str | None = None) -> None:
+        """Finish the current phase, clearing any in-place line and emitting a summary."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clear_active()
+            text = (
+                summary
+                if summary is not None
+                else f"{self._label}: {self._count} done — {self._summary()}"
+            )
+            print(text, file=self._stream, flush=True)
+
+
+# Shared no-op so library call sites can report unconditionally when no reporter
+# was supplied (every method early-returns on ``enabled is False``).
+_NULL_PROGRESS = Progress(enabled=False)
 
 
 def is_content_below_threshold(markdown: str, threshold: int = _CONTENT_THRESHOLD) -> bool:
@@ -873,6 +1005,7 @@ def crawl_site(
     errors: list | None = None,
     type_: str = "Reference",
     diff: dict | None = None,
+    progress: "Progress | None" = None,
 ) -> list[Path]:
     """
     Crawl all in-scope pages from entry_url and write each as markdown.
@@ -892,6 +1025,7 @@ def crawl_site(
         errors: If provided, dicts with "url" and "error" are appended for each failed page.
         diff: If provided, populated with {"created": [page_path...], "updated": [page_path...]}
             distinguishing newly-discovered URLs from URLs whose content_hash changed.
+        progress: If provided, receives live per-page progress; None stays silent.
 
     Returns:
         List of paths to written (or re-converted) markdown files.
@@ -935,6 +1069,9 @@ def crawl_site(
     else:
         urls = raw_urls
 
+    prog = progress if progress is not None else _NULL_PROGRESS
+    prog.start("Crawling", len(urls))
+
     written = []
     created: list[str] = []
     updated: list[str] = []
@@ -943,6 +1080,7 @@ def crawl_site(
             time.sleep(fetch_delay)
         path = compute_output_path(url, urls)
         was_known = url in prior_hashes
+        prog.begin(path)
         result = crawl_page(
             url,
             tool_name=tool_name,
@@ -958,12 +1096,21 @@ def crawl_site(
             page_path = manifest.get(url, {}).get("page_path", path)
             if was_known:
                 updated.append(page_path)
+                prog.item("updated", page_path)
             else:
                 created.append(page_path)
-        elif errors is not None:
+                prog.item("fetched", page_path)
+        else:
             entry = manifest.get(url, {})
             if entry.get("status") == "errored":
-                errors.append({"url": url, "error": entry.get("error", "unknown")})
+                error = entry.get("error", "unknown")
+                prog.item("FAILED", path, error)
+                if errors is not None:
+                    errors.append({"url": url, "error": error})
+            else:
+                prog.item("skipped", path)
+
+    prog.done()
 
     if diff is not None:
         diff["created"] = created
@@ -1579,6 +1726,11 @@ def main() -> None:
         action="store_true",
         help="Skip running the OKF validator on each written bundle",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress live progress on stderr (progress is on by default)",
+    )
     args = parser.parse_args()
 
     if args.show_info:
@@ -1609,6 +1761,7 @@ def main() -> None:
         return
 
     tool = args.tool_name or derive_tool_name(args.url)
+    progress = Progress(enabled=not args.quiet)
     errors: list = []
     diff: dict = {}
     paths = crawl_site(
@@ -1623,6 +1776,7 @@ def main() -> None:
         errors=errors,
         type_=args.type,
         diff=diff,
+        progress=progress,
     )
     for p in paths:
         print(f"Written: {p}")

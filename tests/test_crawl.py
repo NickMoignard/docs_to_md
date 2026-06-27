@@ -1,5 +1,6 @@
 """Tests for crawl.py — single-page and multi-page crawl to markdown."""
 import hashlib
+import io
 import json
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ from bs4 import BeautifulSoup
 
 from crawl import (
     _CONTENT_THRESHOLD,
+    Progress,
     _fetch_with_retry,
     _summarize_batch,
     batch_pages_by_directory,
@@ -2943,3 +2945,150 @@ class TestOKFConformance:
             f"validator reported non-conformance:\n{result.stdout}\n{result.stderr}"
         )
         assert "conformant" in result.stdout
+
+
+class _TTYStringIO(io.StringIO):
+    """A StringIO that claims to be a terminal, to exercise Progress's TTY path."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+class TestProgress:
+    def test_disabled_writes_nothing(self):
+        buf = io.StringIO()
+        prog = Progress(stream=buf, enabled=False)
+        prog.start("Crawling", 3)
+        prog.begin("a")
+        prog.item("fetched", "a")
+        prog.banner("x")
+        prog.note("y")
+        prog.done()
+        assert buf.getvalue() == ""
+
+    def test_non_tty_detected_from_plain_stream(self):
+        prog = Progress(stream=io.StringIO())
+        assert prog.is_tty is False
+
+    def test_tty_detected_from_isatty_stream(self):
+        prog = Progress(stream=_TTYStringIO())
+        assert prog.is_tty is True
+
+    def test_non_tty_throttles_to_milestones_and_summary(self):
+        buf = io.StringIO()
+        prog = Progress(stream=buf)
+        prog.start("Crawling", 20)  # step = 20 // 10 = 2
+        for i in range(20):
+            prog.item("fetched", f"p{i}")
+        prog.done()
+        lines = [ln for ln in buf.getvalue().splitlines() if ln]
+        # One start line, a milestone line every 2 items (10), one done line.
+        assert lines[0] == "Crawling: 20 pages"
+        milestones = [ln for ln in lines if ln.strip().startswith("[")]
+        assert len(milestones) == 10
+        assert lines[-1] == "Crawling: 20 done — 20 fetched"
+
+    def test_non_tty_always_prints_failures_in_full(self):
+        buf = io.StringIO()
+        prog = Progress(stream=buf)
+        prog.start("Crawling", 100)  # step = 10, so a single failure is below threshold
+        prog.item("FAILED", "broken/page", "HTTP 500")
+        out = buf.getvalue()
+        assert "FAILED broken/page: HTTP 500" in out
+
+    def test_done_summary_tallies_each_status(self):
+        buf = io.StringIO()
+        prog = Progress(stream=buf)
+        prog.start("Crawling", 4)
+        prog.item("fetched", "a")
+        prog.item("updated", "b")
+        prog.item("skipped", "c")
+        prog.item("FAILED", "d", "boom")
+        prog.done()
+        summary = buf.getvalue().splitlines()[-1]
+        assert "1 fetched" in summary
+        assert "1 updated" in summary
+        assert "1 skipped" in summary
+        assert "1 FAILED" in summary
+
+    def test_tty_renders_in_place_with_carriage_return(self):
+        buf = _TTYStringIO()
+        prog = Progress(stream=buf)
+        prog.start("Crawling", 2)
+        prog.begin("payments/refunds")
+        prog.item("fetched", "payments/refunds")
+        out = buf.getvalue()
+        assert "\r" in out
+        assert "\x1b[K" in out
+        assert "[1/2] fetched payments/refunds" in out
+
+    def test_thread_safe_counter_under_concurrent_items(self):
+        buf = io.StringIO()
+        prog = Progress(stream=buf)
+        prog.start("Summarizing", 200)
+
+        def worker(n):
+            for _ in range(n):
+                prog.item("summarized", "x")
+
+        threads = [threading.Thread(target=worker, args=(50,)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        prog.done()
+        assert prog._count == 200
+        assert prog._tally["summarized"] == 200
+        assert buf.getvalue().splitlines()[-1] == "Summarizing: 200 done — 200 summarized"
+
+
+class TestCrawlSiteProgress:
+    def _patch_pipeline(self, urls, results):
+        """Make crawl_site iterate `urls`, with crawl_page returning `results` in order."""
+        return urls, results
+
+    def test_crawl_site_reports_per_page_status(self, tmp_path):
+        urls = [
+            "https://docs.stripe.com/payments/a",
+            "https://docs.stripe.com/payments/b",
+        ]
+        buf = io.StringIO()
+        prog = Progress(stream=buf)
+
+        def fake_crawl_page(url, **kwargs):
+            return Path(kwargs["page_path"])  # both succeed → "fetched"
+
+        with patch("crawl.fetch_sitemap_urls", return_value=urls), \
+             patch("crawl.crawl_page", side_effect=fake_crawl_page), \
+             patch("crawl.save_manifest"), \
+             patch("crawl.load_manifest", return_value={}):
+            crawl_site(
+                "https://docs.stripe.com/payments",
+                tool_name="stripe",
+                base_dir=tmp_path,
+                fetch_delay=0,
+                progress=prog,
+            )
+
+        out = buf.getvalue()
+        assert "Crawling: 2 pages" in out
+        assert "2 done — 2 fetched" in out
+
+    def test_crawl_site_silent_when_progress_none(self, tmp_path, capsys):
+        urls = ["https://docs.stripe.com/payments/a"]
+
+        def fake_crawl_page(url, **kwargs):
+            return Path(kwargs["page_path"])
+
+        with patch("crawl.fetch_sitemap_urls", return_value=urls), \
+             patch("crawl.crawl_page", side_effect=fake_crawl_page), \
+             patch("crawl.save_manifest"), \
+             patch("crawl.load_manifest", return_value={}):
+            crawl_site(
+                "https://docs.stripe.com/payments",
+                tool_name="stripe",
+                base_dir=tmp_path,
+                fetch_delay=0,
+            )
+        # No reporter → nothing on stderr from the crawl loop.
+        assert capsys.readouterr().err == ""
