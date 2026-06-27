@@ -142,6 +142,10 @@ step 4 keeps greppable, so they must run.
 
 The crawler writes markdown to `docs/tools/<tool_name>/` relative to the current working directory (the calling repo's root).
 
+Leave progress **on** (do not pass `--quiet`). The crawler streams live progress to
+stderr; when captured (as here) it is throttled to per-phase milestones plus any
+failures, so it stays compact while still signalling the crawl is making headway.
+
 ### 6. Report
 
 After crawling completes, print a brief summary:
