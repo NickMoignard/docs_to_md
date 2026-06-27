@@ -198,9 +198,27 @@ the repo you want the docs in before running.
 | `--summarize-batch-size <N>` | Pages per summary batch (default 15). |
 | `--synthesize` | Generate the glossary, per-directory listings, and bundles index. |
 | `--no-validate` | Skip the post-crawl OKF bundle validation. |
+| `--quiet` | Suppress the live progress shown on stderr (progress is on by default). |
 
 Every crawl ends by validating each bundle with the bundled `scripts/validate.sh`,
 which **exits non-zero on conformance errors**. Pass `--no-validate` to skip it.
+
+### Progress
+
+While a crawl runs, the crawler reports live progress on **stderr** — discovery,
+per-page fetch status (`fetched` / `updated` / `skipped` / `FAILED`), summarisation,
+and the synthesis and validation phases. Standard output is unchanged: the `Written:`
+lines and end-of-run summary still go to **stdout**, so anything parsing them is
+unaffected.
+
+The rendering adapts to where stderr points:
+
+- **Interactive terminal** — a single line updates in place, page by page.
+- **Captured (piped, or run by the skill/agent)** — progress is throttled to
+  periodic milestones plus a per-phase summary, and every failure is printed in
+  full, keeping captured output compact.
+
+Pass `--quiet` to silence it entirely.
 
 ### Recipes
 
