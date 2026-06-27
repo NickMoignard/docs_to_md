@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
@@ -84,6 +85,137 @@ _CONTENT_SELECTORS = [
 ]
 
 _CONTENT_THRESHOLD = 200
+
+
+class Progress:
+    """Live progress reporter for a crawl run.
+
+    Writes to a stream (default ``sys.stderr``). When that stream is a TTY it
+    renders a single in-place line per item; otherwise it throttles to milestone
+    lines (~every 10% of items) so output captured by the skill/agent stays
+    compact. Failures are always printed in full, in both modes.
+
+    Construct one in ``main()`` and pass it into the library functions
+    (``crawl_site`` and friends). They stay silent when handed ``None`` — use the
+    shared ``_NULL_PROGRESS`` no-op so call sites need no guards. Thread-safe: all
+    rendering and counter updates happen under a lock, so the summarize worker
+    pool can report concurrently.
+    """
+
+    def __init__(self, stream=None, *, enabled: bool = True):
+        self._stream = sys.stderr if stream is None else stream
+        self.enabled = enabled
+        try:
+            self.is_tty = bool(self._stream.isatty())
+        except Exception:
+            self.is_tty = False
+        self._lock = threading.Lock()
+        self._active = False  # an unfinished in-place TTY line is on screen
+        self._label = ""
+        self._total = 0
+        self._count = 0
+        self._tally: dict[str, int] = defaultdict(int)
+        self._step = 1
+        self._last_emit = 0
+
+    def _clear_active(self) -> None:
+        """Erase a pending in-place TTY line. Caller must hold the lock."""
+        if self._active and self.is_tty:
+            self._stream.write("\r\x1b[K")
+            self._stream.flush()
+        self._active = False
+
+    def _summary(self) -> str:
+        return ", ".join(f"{n} {status}" for status, n in self._tally.items())
+
+    def banner(self, text: str) -> None:
+        """Emit a one-off phase banner line (e.g. 'Validating bundle…')."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clear_active()
+            print(text, file=self._stream, flush=True)
+
+    def start(self, label: str, total: int) -> None:
+        """Begin a counted phase, resetting counters and the milestone step."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clear_active()
+            self._label = label
+            self._total = total
+            self._count = 0
+            self._tally = defaultdict(int)
+            self._step = max(1, total // 10)
+            self._last_emit = 0
+            print(
+                f"{label}: {total} pages" if total else f"{label}…",
+                file=self._stream,
+                flush=True,
+            )
+
+    def begin(self, name: str) -> None:
+        """TTY-only: show the in-progress action before an item resolves."""
+        if not self.enabled or not self.is_tty:
+            return
+        with self._lock:
+            self._stream.write(f"\r\x1b[K  [{self._count}/{self._total}] {name}…")
+            self._stream.flush()
+            self._active = True
+
+    def item(self, status: str, name: str, detail: str | None = None) -> None:
+        """Report one completed item with its status (fetched/updated/skipped/FAILED)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._count += 1
+            self._tally[status] += 1
+            if status == "FAILED":
+                self._clear_active()
+                line = f"  FAILED {name}"
+                if detail:
+                    line += f": {detail}"
+                print(line, file=self._stream, flush=True)
+                return
+            if self.is_tty:
+                self._stream.write(
+                    f"\r\x1b[K  [{self._count}/{self._total}] {status} {name}"
+                )
+                self._stream.flush()
+                self._active = True
+            elif self._count - self._last_emit >= self._step or self._count == self._total:
+                self._last_emit = self._count
+                print(
+                    f"  [{self._count}/{self._total}] {self._summary()}",
+                    file=self._stream,
+                    flush=True,
+                )
+
+    def note(self, text: str) -> None:
+        """Heartbeat line for unknown-total phases (e.g. BFS discovery)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clear_active()
+            print(text, file=self._stream, flush=True)
+
+    def done(self, summary: str | None = None) -> None:
+        """Finish the current phase, clearing any in-place line and emitting a summary."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clear_active()
+            text = (
+                summary
+                if summary is not None
+                else f"{self._label}: {self._count} done — {self._summary()}"
+            )
+            print(text, file=self._stream, flush=True)
+
+
+# Shared no-op so library call sites can report unconditionally when no reporter
+# was supplied (every method early-returns on ``enabled is False``).
+_NULL_PROGRESS = Progress(enabled=False)
 
 
 def is_content_below_threshold(markdown: str, threshold: int = _CONTENT_THRESHOLD) -> bool:
@@ -394,8 +526,13 @@ def _bfs_discover(
     robots: RobotFileParser | None = None,
     extra_headers: dict | None = None,
     fetch_delay: float = 0.0,
+    progress: "Progress | None" = None,
 ) -> list[str]:
-    """BFS discovery of all in-scope pages starting from entry_url."""
+    """BFS discovery of all in-scope pages starting from entry_url.
+
+    progress, if provided, gets a throttled heartbeat as the (unknown) total grows.
+    """
+    prog = progress if progress is not None else _NULL_PROGRESS
     visited: set[str] = set()
     queue: deque[str] = deque([entry_url])
     ordered: list[str] = []
@@ -413,6 +550,8 @@ def _bfs_discover(
             continue
         visited.add(url)
         ordered.append(url)
+        if len(ordered) % 25 == 0:
+            prog.note(f"Discovering: {len(ordered)} URLs so far…")
 
         if not first and fetch_delay > 0:
             time.sleep(fetch_delay)
@@ -427,6 +566,7 @@ def _bfs_discover(
         except requests.RequestException:
             continue
 
+    prog.note(f"Discovered {len(ordered)} URLs via link-following.")
     return ordered
 
 
@@ -873,6 +1013,7 @@ def crawl_site(
     errors: list | None = None,
     type_: str = "Reference",
     diff: dict | None = None,
+    progress: "Progress | None" = None,
 ) -> list[Path]:
     """
     Crawl all in-scope pages from entry_url and write each as markdown.
@@ -892,6 +1033,7 @@ def crawl_site(
         errors: If provided, dicts with "url" and "error" are appended for each failed page.
         diff: If provided, populated with {"created": [page_path...], "updated": [page_path...]}
             distinguishing newly-discovered URLs from URLs whose content_hash changed.
+        progress: If provided, receives live per-page progress; None stays silent.
 
     Returns:
         List of paths to written (or re-converted) markdown files.
@@ -920,20 +1062,29 @@ def crawl_site(
                 written.append(result)
         return written
 
+    prog = progress if progress is not None else _NULL_PROGRESS
     robots = fetch_robots(entry_url) if safe_mode else None
     scope = derive_crawl_scope(entry_url)
-    raw_urls = fetch_sitemap_urls(entry_url, scope) or _bfs_discover(
-        entry_url, scope,
-        safe_mode=safe_mode,
-        robots=robots,
-        extra_headers=extra_headers,
-        fetch_delay=fetch_delay,
-    )
+    sitemap_urls = fetch_sitemap_urls(entry_url, scope)
+    if sitemap_urls:
+        prog.note(f"Discovered {len(sitemap_urls)} URLs via sitemap.")
+        raw_urls = sitemap_urls
+    else:
+        raw_urls = _bfs_discover(
+            entry_url, scope,
+            safe_mode=safe_mode,
+            robots=robots,
+            extra_headers=extra_headers,
+            fetch_delay=fetch_delay,
+            progress=prog,
+        )
 
     if safe_mode and robots:
         urls = [u for u in raw_urls if is_allowed_by_robots(u, robots)]
     else:
         urls = raw_urls
+
+    prog.start("Crawling", len(urls))
 
     written = []
     created: list[str] = []
@@ -943,6 +1094,7 @@ def crawl_site(
             time.sleep(fetch_delay)
         path = compute_output_path(url, urls)
         was_known = url in prior_hashes
+        prog.begin(path)
         result = crawl_page(
             url,
             tool_name=tool_name,
@@ -958,12 +1110,21 @@ def crawl_site(
             page_path = manifest.get(url, {}).get("page_path", path)
             if was_known:
                 updated.append(page_path)
+                prog.item("updated", page_path)
             else:
                 created.append(page_path)
-        elif errors is not None:
+                prog.item("fetched", page_path)
+        else:
             entry = manifest.get(url, {})
             if entry.get("status") == "errored":
-                errors.append({"url": url, "error": entry.get("error", "unknown")})
+                error = entry.get("error", "unknown")
+                prog.item("FAILED", path, error)
+                if errors is not None:
+                    errors.append({"url": url, "error": error})
+            else:
+                prog.item("skipped", path)
+
+    prog.done()
 
     if diff is not None:
         diff["created"] = created
@@ -1066,12 +1227,17 @@ def _summarize_batch(
     manifest: dict,
     tool_name: str,
     base_dir: Path,
+    progress: "Progress | None" = None,
 ) -> dict:
     """Summarize a batch of pages by calling the LLM and writing results to frontmatter.
 
     Skips pages whose frontmatter content_hash matches the manifest (unchanged) and
     that already have a non-empty description. Returns candidates, done count, failed count.
+
+    progress, if provided, receives one item() call per page; it is shared across
+    the summarize worker pool, so updates are made under its lock.
     """
+    prog = progress if progress is not None else _NULL_PROGRESS
     candidates: list[str] = []
     done = 0
     failed = 0
@@ -1080,16 +1246,19 @@ def _summarize_batch(
         entry = manifest.get(url)
         if not entry or not entry.get("page_path"):
             failed += 1
+            prog.item("FAILED", url, "no page_path in manifest")
             continue
 
         page_path = entry["page_path"]
         md_path = base_dir / "docs" / "tools" / tool_name / (page_path + ".md")
         if not md_path.exists():
             failed += 1
+            prog.item("FAILED", page_path, "markdown file missing")
             continue
 
         fm = read_page_frontmatter(md_path)
         if fm.get("description") and fm.get("content_hash") == entry.get("content_hash"):
+            prog.item("skipped", page_path)
             continue
 
         try:
@@ -1103,8 +1272,10 @@ def _summarize_batch(
             })
             candidates.extend(result["candidates"])
             done += 1
-        except Exception:
+            prog.item("summarized", page_path)
+        except Exception as exc:
             failed += 1
+            prog.item("FAILED", page_path, str(exc) or exc.__class__.__name__)
 
     return {"candidates": candidates, "done": done, "failed": failed}
 
@@ -1455,12 +1626,16 @@ def summarize_site(
     base_dir: Path | None = None,
     concurrency: int = 6,
     batch_size: int = 15,
+    progress: "Progress | None" = None,
 ) -> dict:
     """Fan out page summarization across all pages for a tool.
 
     Batches pages by URL-path directory and dispatches up to `concurrency`
     workers concurrently. Each worker calls the LLM to write summary and
     keywords into frontmatter and collects candidate glossary terms.
+
+    progress, if provided, receives live per-page updates as workers complete
+    (out of order, since the pool runs concurrently); None stays silent.
 
     Returns {"candidates": list[str], "done": int, "failed": int}.
     """
@@ -1473,13 +1648,16 @@ def summarize_site(
 
     batches = batch_pages_by_directory(list(manifest.keys()), batch_size=batch_size)
 
+    prog = progress if progress is not None else _NULL_PROGRESS
+    prog.start("Summarizing", sum(len(b) for b in batches))
+
     all_candidates: list[str] = []
     total_done = 0
     total_failed = 0
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [
-            executor.submit(_summarize_batch, batch, manifest, tool_name, base_dir)
+            executor.submit(_summarize_batch, batch, manifest, tool_name, base_dir, prog)
             for batch in batches
         ]
         for future in futures:
@@ -1487,6 +1665,8 @@ def summarize_site(
             all_candidates.extend(result["candidates"])
             total_done += result["done"]
             total_failed += result["failed"]
+
+    prog.done()
 
     return {"candidates": all_candidates, "done": total_done, "failed": total_failed}
 
@@ -1579,6 +1759,11 @@ def main() -> None:
         action="store_true",
         help="Skip running the OKF validator on each written bundle",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress live progress on stderr (progress is on by default)",
+    )
     args = parser.parse_args()
 
     if args.show_info:
@@ -1609,6 +1794,7 @@ def main() -> None:
         return
 
     tool = args.tool_name or derive_tool_name(args.url)
+    progress = Progress(enabled=not args.quiet)
     errors: list = []
     diff: dict = {}
     paths = crawl_site(
@@ -1623,6 +1809,7 @@ def main() -> None:
         errors=errors,
         type_=args.type,
         diff=diff,
+        progress=progress,
     )
     for p in paths:
         print(f"Written: {p}")
@@ -1637,6 +1824,7 @@ def main() -> None:
             tool,
             concurrency=args.summarize_concurrency,
             batch_size=args.summarize_batch_size,
+            progress=progress,
         )
         candidates = tally["candidates"]
         print(f"\nSummarized {tally['done']} pages ({tally['failed']} failed).")
@@ -1646,6 +1834,7 @@ def main() -> None:
     # Synthesis builds the reserved OKF files (per-directory index.md, glossary,
     # tools map, log) so the bundle is structurally valid. Always run it after a
     # crawl/convert; the glossary LLM call is a no-op when there are no candidates.
+    progress.banner("Synthesizing navigation layer…")
     synthesis = synthesize_site(
         tool,
         candidates,
@@ -1661,6 +1850,7 @@ def main() -> None:
     # Validate each bundle written this run; exit non-zero if any fail.
     if not args.no_validate:
         bundle_dir = Path(".") / "docs" / "tools" / tool
+        progress.banner("Validating bundle…")
         print(f"\nValidating bundle: {bundle_dir}")
         code = validate_bundle(bundle_dir)
         if code is not None and code != 0:
