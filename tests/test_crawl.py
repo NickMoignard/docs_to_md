@@ -2286,7 +2286,7 @@ class TestSummarizeSite:
         counter = {"current": 0, "peak": 0}
         lock = threading.Lock()
 
-        def slow_batch(urls, manifest, tool_name, base_dir):
+        def slow_batch(urls, manifest, tool_name, base_dir, progress=None):
             with lock:
                 counter["current"] += 1
                 counter["peak"] = max(counter["peak"], counter["current"])
@@ -3092,3 +3092,123 @@ class TestCrawlSiteProgress:
             )
         # No reporter → nothing on stderr from the crawl loop.
         assert capsys.readouterr().err == ""
+
+
+class TestSummarizeProgress:
+    def test_summarize_batch_reports_per_page_statuses(self, tmp_path):
+        # One page summarizes, one is already-summarized-unchanged (skipped),
+        # one has no markdown file (FAILED).
+        _make_summarizable_page(tmp_path, "stripe", "payments/charges")
+        _make_summarizable_page(
+            tmp_path, "stripe", "payments/refunds", summary="Already done."
+        )
+        manifest = {
+            "https://docs.stripe.com/payments/charges": {"page_path": "payments/charges", "content_hash": "abc"},
+            "https://docs.stripe.com/payments/refunds": {"page_path": "payments/refunds", "content_hash": "abc"},
+            "https://docs.stripe.com/payments/missing": {"page_path": "payments/missing", "content_hash": "abc"},
+        }
+        buf = io.StringIO()
+        prog = Progress(stream=buf)
+        prog.start("Summarizing", 3)
+        with patch("crawl.call_summarize_llm",
+                   return_value={"summary": "T.", "keywords": [], "candidates": []}):
+            _summarize_batch(
+                list(manifest.keys()), manifest, "stripe", tmp_path, progress=prog,
+            )
+        prog.done()
+        out = buf.getvalue()
+        assert "summarized" in out
+        assert "skipped" in out
+        assert "FAILED payments/missing" in out
+        assert prog._tally["summarized"] == 1
+        assert prog._tally["skipped"] == 1
+        assert prog._tally["FAILED"] == 1
+
+    def test_summarize_batch_silent_without_progress(self, tmp_path):
+        _make_summarizable_page(tmp_path, "stripe", "payments/charges")
+        manifest = {
+            "https://docs.stripe.com/payments/charges": {"page_path": "payments/charges", "content_hash": "abc"},
+        }
+        with patch("crawl.call_summarize_llm",
+                   return_value={"summary": "T.", "keywords": [], "candidates": []}):
+            # No progress arg → must not raise and must behave as before.
+            result = _summarize_batch(list(manifest.keys()), manifest, "stripe", tmp_path)
+        assert result["done"] == 1
+
+    def test_summarize_site_drives_progress_phase(self, tmp_path):
+        _make_summarizable_page(tmp_path, "stripe", "payments/charges")
+        manifest = {
+            "https://docs.stripe.com/payments/charges": {"page_path": "payments/charges", "content_hash": "abc"},
+        }
+        save_manifest(manifest, "stripe", tmp_path)
+        buf = io.StringIO()
+        prog = Progress(stream=buf)
+        with patch("crawl.call_summarize_llm",
+                   return_value={"summary": "T.", "keywords": [], "candidates": []}):
+            summarize_site("stripe", tmp_path, progress=prog)
+        out = buf.getvalue()
+        assert "Summarizing: 1 pages" in out
+        assert "1 done — 1 summarized" in out
+
+
+class TestDiscoveryProgress:
+    def test_sitemap_discovery_emits_count_note(self, tmp_path):
+        urls = [
+            "https://docs.stripe.com/payments/a",
+            "https://docs.stripe.com/payments/b",
+        ]
+        buf = io.StringIO()
+        prog = Progress(stream=buf)
+
+        def fake_crawl_page(url, **kwargs):
+            return Path(kwargs["page_path"])
+
+        with patch("crawl.fetch_sitemap_urls", return_value=urls), \
+             patch("crawl.crawl_page", side_effect=fake_crawl_page), \
+             patch("crawl.save_manifest"), \
+             patch("crawl.load_manifest", return_value={}):
+            crawl_site(
+                "https://docs.stripe.com/payments",
+                tool_name="stripe",
+                base_dir=tmp_path,
+                fetch_delay=0,
+                progress=prog,
+            )
+        assert "Discovered 2 URLs via sitemap." in buf.getvalue()
+
+    def test_bfs_discovery_emits_final_note(self):
+        scope = ("docs.stripe.com", "/payments")
+        buf = io.StringIO()
+        prog = Progress(stream=buf)
+
+        resp = MagicMock()
+        resp.text = "<html></html>"
+        resp.raise_for_status = lambda: None
+        with patch("crawl._fetch_with_retry", return_value=resp), \
+             patch("crawl.extract_page_links", return_value=[]):
+            from crawl import _bfs_discover
+            _bfs_discover(
+                "https://docs.stripe.com/payments",
+                scope,
+                fetch_delay=0,
+                progress=prog,
+            )
+        assert "Discovered 1 URLs via link-following." in buf.getvalue()
+
+    def test_empty_sitemap_falls_back_to_bfs(self, tmp_path):
+        # fetch_sitemap_urls returns None → BFS must still run (regression guard
+        # for the sitemap/BFS branch restructure).
+        buf = io.StringIO()
+        prog = Progress(stream=buf)
+        with patch("crawl.fetch_sitemap_urls", return_value=None), \
+             patch("crawl._bfs_discover", return_value=[]) as bfs, \
+             patch("crawl.save_manifest"), \
+             patch("crawl.load_manifest", return_value={}):
+            crawl_site(
+                "https://docs.stripe.com/payments",
+                tool_name="stripe",
+                base_dir=tmp_path,
+                fetch_delay=0,
+                progress=prog,
+            )
+        assert bfs.called
