@@ -1,6 +1,8 @@
 """Tests for crawl.py — single-page and multi-page crawl to markdown."""
 import hashlib
 import json
+import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -36,7 +38,8 @@ from crawl import (
     fetch_sitemap_urls,
     fetch_with_playwright,
     generate_glossary,
-    generate_page_map,
+    generate_indexes,
+    generate_log,
     is_allowed_by_robots,
     is_content_below_threshold,
     is_in_scope,
@@ -84,13 +87,15 @@ class TestDerivePagePath:
         assert derive_page_path("https://docs.stripe.com/payments/charges") == "payments/charges"
 
     def test_root_path(self):
-        assert derive_page_path("https://docs.stripe.com/") == "index"
+        assert derive_page_path("https://docs.stripe.com/") == "_root"
 
     def test_no_path(self):
-        assert derive_page_path("https://docs.stripe.com") == "index"
+        assert derive_page_path("https://docs.stripe.com") == "_root"
 
-    def test_trailing_slash_is_index(self):
-        assert derive_page_path("https://docs.stripe.com/payments/") == "payments/index"
+    def test_trailing_slash_not_promoted_to_index(self):
+        # OKF file-and-folder layout: a trailing slash is the same page,
+        # no "/index" promotion.
+        assert derive_page_path("https://docs.stripe.com/payments/") == "payments"
 
     def test_single_segment(self):
         assert derive_page_path("https://docs.stripe.com/payments") == "payments"
@@ -185,10 +190,22 @@ class TestBuildFrontmatter:
             fetched_at="2026-06-20T12:00:00+00:00",
             content_hash="abc123",
         )
+        # OKF field names: source_url → resource, fetched_at → timestamp.
         assert "title: Test Page" in fm
-        assert "source_url: https://docs.example.com/page" in fm
-        assert "fetched_at:" in fm
+        assert "resource: https://docs.example.com/page" in fm
+        assert "timestamp:" in fm
         assert "content_hash: abc123" in fm
+        # Required OKF `type` field, defaulting to Reference and emitted first.
+        assert "type: Reference" in fm
+        assert fm.index("type:") < fm.index("title:")
+
+    def test_default_type_is_reference(self):
+        fm = build_frontmatter("T", "https://x.com", "2026-01-01", "hash")
+        assert "type: Reference" in fm
+
+    def test_custom_type_emitted(self):
+        fm = build_frontmatter("T", "https://x.com", "2026-01-01", "hash", type_="Guide")
+        assert "type: Guide" in fm
 
     def test_has_yaml_delimiters(self):
         fm = build_frontmatter("T", "https://x.com", "2026-01-01", "hash")
@@ -252,9 +269,12 @@ class TestCrawlPage:
         )
         content = result.read_text()
         assert content.startswith("---\n")
-        assert "source_url:" in content
-        assert "fetched_at:" in content
+        # OKF frontmatter: resource/timestamp + a non-empty required type.
+        assert "resource:" in content
+        assert "timestamp:" in content
         assert "content_hash:" in content
+        fm = yaml.safe_load(content.split("---\n")[1])
+        assert fm["type"]
 
     def test_output_contains_main_content(self, tmp_path, mock_get):
         result = crawl_page(
@@ -489,30 +509,31 @@ class TestComputeOutputPath:
         ]
         assert compute_output_path("https://docs.stripe.com/payments/charges", urls) == "payments/charges"
 
-    def test_parent_page_becomes_index(self):
+    def test_parent_page_stays_file(self):
+        # File-and-folder layout: a parent page is <path>.md, not <path>/index.md.
         urls = [
             "https://docs.stripe.com/payments",
             "https://docs.stripe.com/payments/charges",
         ]
-        assert compute_output_path("https://docs.stripe.com/payments", urls) == "payments/index"
+        assert compute_output_path("https://docs.stripe.com/payments", urls) == "payments"
 
     def test_only_page_stays_leaf(self):
         urls = ["https://docs.stripe.com/payments"]
         assert compute_output_path("https://docs.stripe.com/payments", urls) == "payments"
 
-    def test_trailing_slash_already_index(self):
+    def test_trailing_slash_not_promoted(self):
         urls = [
             "https://docs.stripe.com/payments/",
             "https://docs.stripe.com/payments/charges",
         ]
-        assert compute_output_path("https://docs.stripe.com/payments/", urls) == "payments/index"
+        assert compute_output_path("https://docs.stripe.com/payments/", urls) == "payments"
 
-    def test_root_page_with_children_is_index(self):
+    def test_root_page_with_children(self):
         urls = [
             "https://docs.stripe.com/",
             "https://docs.stripe.com/payments",
         ]
-        assert compute_output_path("https://docs.stripe.com/", urls) == "index"
+        assert compute_output_path("https://docs.stripe.com/", urls) == "_root"
 
 
 class TestCrawlSite:
@@ -560,8 +581,12 @@ class TestCrawlSite:
                 fetch_delay=0,
             )
         assert len(paths) >= 2
-        assert tmp_path / "docs/tools/stripe/payments/index.md" in paths
+        # File-and-folder: the parent page is payments.md (not payments/index.md),
+        # and its child lives under the payments/ directory.
+        assert tmp_path / "docs/tools/stripe/payments.md" in paths
         assert tmp_path / "docs/tools/stripe/payments/charges.md" in paths
+        assert (tmp_path / "docs/tools/stripe/payments.md").exists()
+        assert (tmp_path / "docs/tools/stripe/payments").is_dir()
 
     def test_sitemap_used_when_present(self, tmp_path):
         def mock_get_fn(url, **kwargs):
@@ -586,7 +611,7 @@ class TestCrawlSite:
                 fetch_delay=0,
             )
         assert len(paths) == 2
-        assert tmp_path / "docs/tools/stripe/payments/index.md" in paths
+        assert tmp_path / "docs/tools/stripe/payments.md" in paths
         assert tmp_path / "docs/tools/stripe/payments/charges.md" in paths
 
     def test_out_of_scope_links_not_crawled(self, tmp_path):
@@ -901,7 +926,7 @@ class TestConvertFromCache:
         result = convert_from_cache("https://docs.stripe.com/payments/charges", entry, "stripe", tmp_path)
         text = result.read_text()
         assert "Charge object" in text
-        assert "source_url:" in text
+        assert "resource:" in text
 
     def test_returns_none_when_cache_missing(self, tmp_path):
         entry = {
@@ -1047,9 +1072,9 @@ class TestCrawlSiteIncremental:
                 fetch_delay=0,
             )
 
-        # payments/index should be written, charges should be skipped (304)
+        # payments.md should be written, charges should be skipped (304)
         written_names = [p.name for p in paths]
-        assert "index.md" in written_names
+        assert "payments.md" in written_names
         assert "charges.md" not in written_names
 
 
@@ -1112,49 +1137,53 @@ class TestExtractNavPath:
 
 
 class TestRewriteLinks:
+    # Under the file-and-folder layout the parent page "payments" is rendered
+    # as payments.md (in the bundle root), so its current_page_path is
+    # "payments" and links into the payments/ directory are relative to root.
     def test_rewrites_in_manifest_link(self):
         soup = BeautifulSoup('<p><a href="https://docs.stripe.com/payments/charges">link</a></p>', "html.parser")
         manifest = {"https://docs.stripe.com/payments/charges": {"page_path": "payments/charges"}}
-        rewrite_links(soup, "https://docs.stripe.com/payments", manifest, "payments/index")
-        assert soup.find("a")["href"] == "charges.md"
+        rewrite_links(soup, "https://docs.stripe.com/payments", manifest, "payments")
+        assert soup.find("a")["href"] == "payments/charges.md"
 
     def test_keeps_external_link_absolute(self):
         soup = BeautifulSoup('<a href="https://external.com/page">link</a>', "html.parser")
-        rewrite_links(soup, "https://docs.stripe.com/payments", {}, "payments/index")
+        rewrite_links(soup, "https://docs.stripe.com/payments", {}, "payments")
         assert soup.find("a")["href"] == "https://external.com/page"
 
     def test_keeps_same_page_anchor(self):
         soup = BeautifulSoup('<a href="#section">link</a>', "html.parser")
-        rewrite_links(soup, "https://docs.stripe.com/payments", {}, "payments/index")
+        rewrite_links(soup, "https://docs.stripe.com/payments", {}, "payments")
         assert soup.find("a")["href"] == "#section"
 
     def test_preserves_anchor_in_rewritten_link(self):
         soup = BeautifulSoup('<a href="https://docs.stripe.com/payments/charges#section">link</a>', "html.parser")
         manifest = {"https://docs.stripe.com/payments/charges": {"page_path": "payments/charges"}}
-        rewrite_links(soup, "https://docs.stripe.com/payments", manifest, "payments/index")
-        assert soup.find("a")["href"] == "charges.md#section"
+        rewrite_links(soup, "https://docs.stripe.com/payments", manifest, "payments")
+        assert soup.find("a")["href"] == "payments/charges.md#section"
 
     def test_keeps_not_in_manifest_link_absolute(self):
         soup = BeautifulSoup('<a href="https://docs.stripe.com/api/charges">link</a>', "html.parser")
-        rewrite_links(soup, "https://docs.stripe.com/payments", {}, "payments/index")
+        rewrite_links(soup, "https://docs.stripe.com/payments", {}, "payments")
         assert soup.find("a")["href"] == "https://docs.stripe.com/api/charges"
 
     def test_resolves_relative_link_and_rewrites_if_in_manifest(self):
         soup = BeautifulSoup('<a href="/payments/charges">link</a>', "html.parser")
         manifest = {"https://docs.stripe.com/payments/charges": {"page_path": "payments/charges"}}
-        rewrite_links(soup, "https://docs.stripe.com/payments", manifest, "payments/index")
-        assert soup.find("a")["href"] == "charges.md"
+        rewrite_links(soup, "https://docs.stripe.com/payments", manifest, "payments")
+        assert soup.find("a")["href"] == "payments/charges.md"
 
     def test_relative_path_across_sections(self):
+        # A child page payments/charges.md linking to api/intro.md.
         soup = BeautifulSoup('<a href="https://docs.stripe.com/api/intro">link</a>', "html.parser")
         manifest = {"https://docs.stripe.com/api/intro": {"page_path": "api/intro"}}
-        rewrite_links(soup, "https://docs.stripe.com/payments", manifest, "payments/index")
+        rewrite_links(soup, "https://docs.stripe.com/payments/charges", manifest, "payments/charges")
         assert soup.find("a")["href"] == "../api/intro.md"
 
     def test_root_page_link(self):
         soup = BeautifulSoup('<a href="https://docs.stripe.com/payments/charges">link</a>', "html.parser")
         manifest = {"https://docs.stripe.com/payments/charges": {"page_path": "payments/charges"}}
-        rewrite_links(soup, "https://docs.stripe.com/", manifest, "index")
+        rewrite_links(soup, "https://docs.stripe.com/", manifest, "_root")
         assert soup.find("a")["href"] == "payments/charges.md"
 
 
@@ -1224,7 +1253,7 @@ class TestCrawlPageIssue5:
                 "https://docs.stripe.com/payments",
                 tool_name="stripe",
                 base_dir=tmp_path,
-                page_path="payments/index",
+                page_path="payments",
                 manifest=manifest,
             )
         content = result.read_text()
@@ -1237,7 +1266,7 @@ class TestCrawlPageIssue5:
                 "https://docs.stripe.com/payments",
                 tool_name="stripe",
                 base_dir=tmp_path,
-                page_path="payments/index",
+                page_path="payments",
                 manifest={},
             )
         content = result.read_text()
@@ -1249,7 +1278,7 @@ class TestCrawlPageIssue5:
                 "https://docs.stripe.com/payments",
                 tool_name="stripe",
                 base_dir=tmp_path,
-                page_path="payments/index",
+                page_path="payments",
                 manifest={},
             )
         content = result.read_text()
@@ -1261,7 +1290,7 @@ class TestCrawlPageIssue5:
                 "https://docs.stripe.com/payments",
                 tool_name="stripe",
                 base_dir=tmp_path,
-                page_path="payments/index",
+                page_path="payments",
             )
         content = result.read_text()
         # Without manifest, relative links are resolved to absolute (not rewritten to .md)
@@ -1293,13 +1322,14 @@ class TestConvertFromCacheIssue5:
         }
         manifest = {
             "https://docs.stripe.com/payments/charges": entry,
-            "https://docs.stripe.com/payments": {"page_path": "payments/index"},
+            "https://docs.stripe.com/payments": {"page_path": "payments"},
         }
         result = convert_from_cache(
             "https://docs.stripe.com/payments/charges", entry, "stripe", tmp_path, manifest=manifest
         )
         content = result.read_text()
-        assert "../payments/index.md" in content or "index.md" in content
+        # Child payments/charges.md links back up to the parent payments.md.
+        assert "../payments.md" in content
 
     def test_nav_path_from_manifest_entry_in_frontmatter(self, tmp_path):
         cache_path = self._setup_cache(tmp_path)
@@ -1789,8 +1819,8 @@ class TestCrawlSiteRobustness:
                 base_dir=tmp_path,
                 fetch_delay=0,
             )
-        # payments/index should be written even though charges failed
-        assert any("index.md" in str(p) for p in paths)
+        # payments.md should be written even though charges failed
+        assert any("payments.md" in str(p) for p in paths)
 
     def test_errored_pages_tracked_in_errors_list(self, tmp_path):
         def mock_get_fn(url, **kwargs):
@@ -1949,9 +1979,10 @@ class TestSkillFile:
 def _make_summarizable_page(tmp_path, tool_name, page_path, content_hash="abc", summary=None):
     md_path = tmp_path / "docs" / "tools" / tool_name / (page_path + ".md")
     md_path.parent.mkdir(parents=True, exist_ok=True)
-    fm = {"title": "Test", "content_hash": content_hash}
+    fm = {"type": "Reference", "title": "Test", "content_hash": content_hash}
+    # The "summarized" marker is the OKF `description` key.
     if summary:
-        fm["summary"] = summary
+        fm["description"] = summary
     fm_text = "---\n" + yaml.dump(fm) + "---\n\n# Test\n\nContent.\n"
     md_path.write_text(fm_text, encoding="utf-8")
     return md_path
@@ -2069,7 +2100,7 @@ class TestWritePageFrontmatter:
 class TestIsPageSummarized:
     def test_true_when_summary_present(self, tmp_path):
         md = tmp_path / "page.md"
-        md.write_text("---\nsummary: A summary.\n---\n\nBody\n", encoding="utf-8")
+        md.write_text("---\ndescription: A summary.\n---\n\nBody\n", encoding="utf-8")
         assert is_page_summarized(md) is True
 
     def test_false_when_no_summary(self, tmp_path):
@@ -2079,7 +2110,7 @@ class TestIsPageSummarized:
 
     def test_false_when_summary_empty_string(self, tmp_path):
         md = tmp_path / "page.md"
-        md.write_text("---\nsummary: ''\n---\n\nBody\n", encoding="utf-8")
+        md.write_text("---\ndescription: ''\n---\n\nBody\n", encoding="utf-8")
         assert is_page_summarized(md) is False
 
     def test_false_when_no_frontmatter(self, tmp_path):
@@ -2143,7 +2174,8 @@ class TestSummarizeBatch:
             _summarize_batch(["https://docs.stripe.com/payments/charges"], manifest, "stripe", tmp_path)
         md = tmp_path / "docs/tools/stripe/payments/charges.md"
         fm = read_page_frontmatter(md)
-        assert fm["summary"] == "Charge API."
+        # The LLM "summary" is mapped onto the OKF `description` frontmatter key.
+        assert fm["description"] == "Charge API."
         assert fm["keywords"] == ["Charge"]
 
     def test_returns_candidate_terms(self, tmp_path):
@@ -2338,8 +2370,15 @@ class TestGenerateGlossary:
     def test_writes_to_correct_path(self, tmp_path):
         with patch("crawl.call_glossary_llm", return_value=[]):
             path = generate_glossary("stripe", ["charge"], tmp_path)
-        assert path == tmp_path / "docs" / "tools" / "stripe" / "CONTEXT.md"
+        assert path == tmp_path / "docs" / "tools" / "stripe" / "glossary.md"
         assert path.exists()
+
+    def test_glossary_has_glossary_type(self, tmp_path):
+        with patch("crawl.call_glossary_llm", return_value=[]):
+            path = generate_glossary("stripe", [], tmp_path)
+        content = path.read_text()
+        assert content.startswith("---\n")
+        assert "type: Glossary" in content
 
     def test_contains_auto_generated_marker(self, tmp_path):
         with patch("crawl.call_glossary_llm", return_value=[]):
@@ -2389,89 +2428,114 @@ class TestGenerateGlossary:
         mock_llm.assert_called_once_with([], "stripe")
 
 
-class TestGeneratePageMap:
+class TestGenerateIndexes:
+    """generate_indexes replaces the old generate_page_map: it writes a reserved
+    per-directory index.md into every directory of the bundle."""
+
     def _make_page(self, tmp_path, tool_name, page_path, summary=None):
         md_path = tmp_path / "docs" / "tools" / tool_name / (page_path + ".md")
         md_path.parent.mkdir(parents=True, exist_ok=True)
-        fm = {"title": "Test", "content_hash": "abc"}
+        fm = {"type": "Reference", "title": "Test", "content_hash": "abc"}
         if summary:
-            fm["summary"] = summary
+            fm["description"] = summary
         fm_text = "---\n" + yaml.dump(fm) + "---\n\n# Test\n"
         md_path.write_text(fm_text, encoding="utf-8")
         return md_path
 
-    def test_writes_to_correct_path(self, tmp_path):
+    def test_writes_root_index(self, tmp_path):
         manifest = {
             "https://docs.stripe.com/payments": {"page_path": "payments"},
         }
         self._make_page(tmp_path, "stripe", "payments")
         save_manifest(manifest, "stripe", tmp_path)
-        path = generate_page_map("stripe", tmp_path)
-        assert path == tmp_path / "docs" / "tools" / "stripe" / "_index.md"
-        assert path.exists()
+        paths = generate_indexes("stripe", tmp_path)
+        root_index = tmp_path / "docs" / "tools" / "stripe" / "index.md"
+        assert root_index in paths
+        assert root_index.exists()
 
-    def test_contains_auto_generated_marker(self, tmp_path):
-        save_manifest({}, "stripe", tmp_path)
-        path = generate_page_map("stripe", tmp_path)
-        assert "<!-- auto-generated -->" in path.read_text()
+    def test_root_index_has_okf_version_frontmatter(self, tmp_path):
+        manifest = {
+            "https://docs.stripe.com/payments": {"page_path": "payments"},
+        }
+        self._make_page(tmp_path, "stripe", "payments")
+        save_manifest(manifest, "stripe", tmp_path)
+        generate_indexes("stripe", tmp_path)
+        content = (tmp_path / "docs" / "tools" / "stripe" / "index.md").read_text()
+        assert content.startswith("---\n")
+        assert "okf_version:" in content
+        assert "0.1" in content
 
-    def test_lists_pages_with_summaries(self, tmp_path):
+    def test_nested_index_has_no_frontmatter(self, tmp_path):
+        # A child page forces a payments/ subdirectory with its own index.md.
+        manifest = {
+            "https://docs.stripe.com/payments": {"page_path": "payments"},
+            "https://docs.stripe.com/payments/charges": {"page_path": "payments/charges"},
+        }
+        self._make_page(tmp_path, "stripe", "payments")
+        self._make_page(tmp_path, "stripe", "payments/charges")
+        save_manifest(manifest, "stripe", tmp_path)
+        generate_indexes("stripe", tmp_path)
+        nested = tmp_path / "docs" / "tools" / "stripe" / "payments" / "index.md"
+        assert nested.exists()
+        assert not nested.read_text().startswith("---")
+
+    def test_lists_child_concepts_with_descriptions(self, tmp_path):
         manifest = {
             "https://docs.stripe.com/payments": {"page_path": "payments"},
         }
         self._make_page(tmp_path, "stripe", "payments", summary="Payments overview.")
         save_manifest(manifest, "stripe", tmp_path)
-        path = generate_page_map("stripe", tmp_path)
-        content = path.read_text()
-        assert "Payments overview." in content
+        generate_indexes("stripe", tmp_path)
+        content = (tmp_path / "docs" / "tools" / "stripe" / "index.md").read_text()
         assert "payments.md" in content
+        assert "Payments overview." in content
 
-    def test_lists_page_without_summary(self, tmp_path):
+    def test_lists_child_without_description(self, tmp_path):
         manifest = {
             "https://docs.stripe.com/payments": {"page_path": "payments"},
         }
         self._make_page(tmp_path, "stripe", "payments")
         save_manifest(manifest, "stripe", tmp_path)
-        path = generate_page_map("stripe", tmp_path)
-        content = path.read_text()
+        generate_indexes("stripe", tmp_path)
+        content = (tmp_path / "docs" / "tools" / "stripe" / "index.md").read_text()
         assert "payments.md" in content
 
-    def test_entries_sorted_by_url_path(self, tmp_path):
+    def test_subdirectory_linked_from_parent_index(self, tmp_path):
         manifest = {
-            "https://docs.stripe.com/refunds": {"page_path": "refunds"},
-            "https://docs.stripe.com/api": {"page_path": "api"},
             "https://docs.stripe.com/payments": {"page_path": "payments"},
+            "https://docs.stripe.com/payments/charges": {"page_path": "payments/charges"},
         }
-        for page_path in ["refunds", "api", "payments"]:
-            self._make_page(tmp_path, "stripe", page_path)
+        self._make_page(tmp_path, "stripe", "payments")
+        self._make_page(tmp_path, "stripe", "payments/charges")
         save_manifest(manifest, "stripe", tmp_path)
-        path = generate_page_map("stripe", tmp_path)
-        content = path.read_text()
-        api_pos = content.index("api.md")
-        payments_pos = content.index("payments.md")
-        refunds_pos = content.index("refunds.md")
-        assert api_pos < payments_pos < refunds_pos
+        generate_indexes("stripe", tmp_path)
+        root = (tmp_path / "docs" / "tools" / "stripe" / "index.md").read_text()
+        # Root index links to the payments/ subdirectory.
+        assert "payments/" in root
 
     def test_accepts_manifest_argument(self, tmp_path):
         manifest = {
             "https://docs.stripe.com/charges": {"page_path": "charges"},
         }
         self._make_page(tmp_path, "stripe", "charges", summary="Charge API.")
-        path = generate_page_map("stripe", tmp_path, manifest=manifest)
-        assert "charges.md" in path.read_text()
+        paths = generate_indexes("stripe", tmp_path, manifest=manifest)
+        root = (tmp_path / "docs" / "tools" / "stripe" / "index.md").read_text()
+        assert "charges.md" in root
+        assert paths
 
-    def test_empty_manifest_writes_header_only(self, tmp_path):
+    def test_empty_manifest_writes_root_index_only(self, tmp_path):
         save_manifest({}, "stripe", tmp_path)
-        path = generate_page_map("stripe", tmp_path)
-        content = path.read_text()
-        assert "stripe — Page Map" in content
-        assert "<!-- auto-generated -->" in content
+        paths = generate_indexes("stripe", tmp_path)
+        root_index = tmp_path / "docs" / "tools" / "stripe" / "index.md"
+        assert paths == [root_index]
+        assert root_index.exists()
 
 
 class TestUpdateToolsMap:
     def test_creates_file_if_absent(self, tmp_path):
+        # The tools collection listing is now the reserved docs/tools/index.md.
         path = update_tools_map("stripe", "https://docs.stripe.com/", tmp_path)
-        assert path == tmp_path / "docs" / "tools" / "CONTEXT-MAP.md"
+        assert path == tmp_path / "docs" / "tools" / "index.md"
         assert path.exists()
 
     def test_adds_tool_entry(self, tmp_path):
@@ -2483,21 +2547,20 @@ class TestUpdateToolsMap:
         update_tools_map("stripe", "https://docs.stripe.com/", tmp_path)
         path = update_tools_map("stripe", "https://docs.stripe.com/", tmp_path)
         content = path.read_text()
-        assert content.count("stripe") == content.count("stripe")
-        assert content.count("- **stripe**") == 1
+        assert content.count("- [stripe]") == 1
 
     def test_multiple_tools_do_not_duplicate(self, tmp_path):
         update_tools_map("stripe", "https://docs.stripe.com/", tmp_path)
         update_tools_map("react", "https://react.dev/", tmp_path)
         update_tools_map("stripe", "https://docs.stripe.com/", tmp_path)
-        content = (tmp_path / "docs" / "tools" / "CONTEXT-MAP.md").read_text()
-        assert content.count("- **stripe**") == 1
-        assert content.count("- **react**") == 1
+        content = (tmp_path / "docs" / "tools" / "index.md").read_text()
+        assert content.count("- [stripe]") == 1
+        assert content.count("- [react]") == 1
 
     def test_created_file_has_header(self, tmp_path):
         path = update_tools_map("stripe", "https://docs.stripe.com/", tmp_path)
         content = path.read_text()
-        assert "# Tools Map" in content
+        assert "# Tools" in content
 
     def test_links_to_tool_directory(self, tmp_path):
         path = update_tools_map("stripe", "https://docs.stripe.com/", tmp_path)
@@ -2506,31 +2569,33 @@ class TestUpdateToolsMap:
 
 
 class TestSynthesisSite:
-    def test_returns_all_three_paths(self, tmp_path):
+    def test_returns_all_synthesis_paths(self, tmp_path):
         save_manifest({}, "stripe", tmp_path)
         with patch("crawl.call_glossary_llm", return_value=[]):
             result = synthesize_site("stripe", [], "https://docs.stripe.com/", tmp_path)
         assert "glossary_path" in result
-        assert "page_map_path" in result
+        assert "index_paths" in result
         assert "tools_map_path" in result
+        assert "log_path" in result
 
     def test_glossary_path_correct(self, tmp_path):
         save_manifest({}, "stripe", tmp_path)
         with patch("crawl.call_glossary_llm", return_value=[]):
             result = synthesize_site("stripe", [], "https://docs.stripe.com/", tmp_path)
-        assert result["glossary_path"] == tmp_path / "docs" / "tools" / "stripe" / "CONTEXT.md"
+        assert result["glossary_path"] == tmp_path / "docs" / "tools" / "stripe" / "glossary.md"
 
-    def test_page_map_path_correct(self, tmp_path):
+    def test_index_paths_include_root(self, tmp_path):
         save_manifest({}, "stripe", tmp_path)
         with patch("crawl.call_glossary_llm", return_value=[]):
             result = synthesize_site("stripe", [], "https://docs.stripe.com/", tmp_path)
-        assert result["page_map_path"] == tmp_path / "docs" / "tools" / "stripe" / "_index.md"
+        root_index = tmp_path / "docs" / "tools" / "stripe" / "index.md"
+        assert root_index in result["index_paths"]
 
     def test_tools_map_path_correct(self, tmp_path):
         save_manifest({}, "stripe", tmp_path)
         with patch("crawl.call_glossary_llm", return_value=[]):
             result = synthesize_site("stripe", [], "https://docs.stripe.com/", tmp_path)
-        assert result["tools_map_path"] == tmp_path / "docs" / "tools" / "CONTEXT-MAP.md"
+        assert result["tools_map_path"] == tmp_path / "docs" / "tools" / "index.md"
 
     def test_passes_candidates_to_glossary(self, tmp_path):
         save_manifest({}, "stripe", tmp_path)
@@ -2544,13 +2609,15 @@ class TestSynthesisSite:
         assert "Charge" in calls[0]
         assert "Refund" in calls[0]
 
-    def test_all_three_files_written(self, tmp_path):
+    def test_all_synthesis_files_written(self, tmp_path):
         save_manifest({}, "stripe", tmp_path)
         with patch("crawl.call_glossary_llm", return_value=[]):
             result = synthesize_site("stripe", [], "https://docs.stripe.com/", tmp_path)
         assert result["glossary_path"].exists()
-        assert result["page_map_path"].exists()
+        assert all(p.exists() for p in result["index_paths"])
+        assert result["index_paths"]
         assert result["tools_map_path"].exists()
+        assert result["log_path"].exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2791,3 +2858,88 @@ class TestCodeBlockFidelity:
         assert "x = 1" in md
         assert "const x = 1;" in md
         assert md.count("```") >= 4
+
+
+# ---------------------------------------------------------------------------
+# OKF v0.1 conformance — synthesize a real bundle offline and run the vendored
+# validator (scripts/validate.sh) against it.
+# ---------------------------------------------------------------------------
+
+
+class TestOKFConformance:
+    # Rich enough to stay above _CONTENT_THRESHOLD so the (stubbed) Playwright
+    # fallback is never triggered during the offline crawl.
+    PARENT_HTML = (
+        "<!DOCTYPE html>\n<html><head><title>Payments</title></head>\n<body><main>\n"
+        "<h1>Payments</h1>"
+        + "<p>Payments overview paragraph with plenty of substantive prose.</p>" * 12
+        + "\n<a href='/payments/charges'>Charges</a>\n</main></body></html>"
+    )
+    CHILD_HTML = (
+        "<!DOCTYPE html>\n<html><head><title>Charges</title></head>\n<body><main>\n"
+        "<h1>Charges</h1>"
+        + "<p>The Charge object represents a payment with plenty of prose.</p>" * 12
+        + "\n</main></body></html>"
+    )
+
+    def _mock_response(self, html):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = html
+        resp.raise_for_status = MagicMock()
+        resp.headers = MagicMock()
+        resp.headers.get = lambda key, default=None: None
+        return resp
+
+    def test_synthesized_bundle_is_okf_conformant(self, tmp_path):
+        if shutil.which("bash") is None:
+            pytest.skip("bash is not available")
+        validator = Path(__file__).resolve().parent.parent / "scripts" / "validate.sh"
+        if not validator.exists():
+            pytest.skip(f"validator not found at {validator}")
+
+        tool = "stripe"
+        parent_url = "https://docs.stripe.com/payments"
+        child_url = "https://docs.stripe.com/payments/charges"
+        manifest: dict = {}
+
+        # Crawl two pages offline into the bundle: a parent page (payments.md)
+        # and a child (payments/charges.md) under the payments/ directory.
+        def fake_get(url, **kwargs):
+            if url.rstrip("/") == parent_url:
+                return self._mock_response(self.PARENT_HTML)
+            return self._mock_response(self.CHILD_HTML)
+
+        with patch("crawl.requests.get", side_effect=fake_get):
+            crawl_page(parent_url, tool_name=tool, base_dir=tmp_path,
+                       page_path="payments", manifest=manifest)
+            crawl_page(child_url, tool_name=tool, base_dir=tmp_path,
+                       page_path="payments/charges", manifest=manifest)
+        save_manifest(manifest, tool, tmp_path)
+
+        # Synthesize glossary, per-directory indexes, tools map and log.
+        with patch("crawl.call_glossary_llm",
+                   return_value=[{"term": "Charge", "definition": "A payment object."}]):
+            synthesize_site(
+                tool, ["Charge"], parent_url, tmp_path,
+                manifest=manifest,
+                created=["payments", "payments/charges"],
+                updated=[],
+            )
+
+        bundle = tmp_path / "docs" / "tools" / tool
+        # Sanity: the file-and-folder layout produced the expected shape.
+        assert (bundle / "payments.md").exists()
+        assert (bundle / "payments" / "charges.md").exists()
+        assert (bundle / "index.md").exists()
+        assert (bundle / "glossary.md").exists()
+        assert (bundle / "log.md").exists()
+
+        result = subprocess.run(
+            ["bash", str(validator), str(bundle)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, (
+            f"validator reported non-conformance:\n{result.stdout}\n{result.stderr}"
+        )
+        assert "conformant" in result.stdout

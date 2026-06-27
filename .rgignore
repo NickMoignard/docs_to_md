@@ -1,0 +1,7 @@
+# docs-to-okf:rgignore start
+/docs/tools/**
+!/docs/tools/**/
+!/docs/tools/**/index.md
+!/docs/tools/**/glossary.md
+!/docs/tools/**/log.md
+# docs-to-okf:rgignore end

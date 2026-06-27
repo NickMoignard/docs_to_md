@@ -173,7 +173,7 @@ wheels = [
 ]
 
 [[package]]
-name = "docs-to-md"
+name = "docs-to-okf"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

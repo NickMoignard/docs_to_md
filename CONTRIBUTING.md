@@ -1,11 +1,11 @@
-# Contributing to docs-to-md
+# Contributing to docs-to-okf
 
-Thanks for your interest in improving docs-to-md! This project uses the standard
+Thanks for your interest in improving docs-to-okf! This project uses the standard
 **fork-and-pull-request** model. You don't need write access to contribute.
 
 ## Before you start
 
-- **Found a bug or have an idea?** [Open an issue](https://github.com/NickMoignard/docs_to_md/issues)
+- **Found a bug or have an idea?** [Open an issue](https://github.com/NickMoignard/docs_to_okf/issues)
   first. For anything beyond a small fix, it's worth agreeing on the approach before you
   write code.
 - **Read [`CONTEXT.md`](CONTEXT.md).** It's the project's glossary. We're deliberate about
@@ -20,13 +20,14 @@ Thanks for your interest in improving docs-to-md! This project uses the standard
 2. **Clone your fork** and create a branch off `master`:
 
    ```bash
-   git clone https://github.com/<your-username>/docs_to_md.git
-   cd docs_to_md
+   git clone https://github.com/<your-username>/docs_to_okf.git
+   cd docs_to_okf
    git checkout -b my-change
    ```
 
-3. **Make your change.** The skill is two files — `SKILL.md` (orchestration) and
-   `crawl.py` (the crawler). See [`README.md`](README.md) for how they fit together and
+3. **Make your change.** The skill is three files — `SKILL.md` (orchestration),
+   `crawl.py` (the crawler), and `scripts/validate.sh` (the bundled OKF validator). See
+   [`README.md`](README.md) for how they fit together and
    [`docs/adr/`](docs/adr/) for the reasoning behind key design decisions.
 
 4. **Run the tests** and make sure they pass:

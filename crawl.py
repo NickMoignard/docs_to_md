@@ -34,7 +34,7 @@ from bs4 import BeautifulSoup
 
 _COMMON_SUBDOMAINS = {"www", "docs", "api", "developer", "developers", "help", "support"}
 
-_HEADERS = {"User-Agent": "docs-to-md/1.0 (+https://github.com/NickMoignard/docs_to_md)"}
+_HEADERS = {"User-Agent": "docs-to-okf/1.0 (+https://github.com/NickMoignard/docs_to_okf)"}
 
 _FETCH_DELAY: float = 1.0
 _RETRY_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
@@ -174,13 +174,17 @@ def derive_tool_name(url: str) -> str:
 
 
 def derive_page_path(url: str) -> str:
-    """Convert URL path to a relative file path (no leading slash, no .md extension)."""
+    """Convert URL path to a relative file path (no leading slash, no .md extension).
+
+    Under the OKF file-and-folder layout, a page maps directly to <path>; a
+    trailing slash is treated as the same page (no "/index" promotion). The
+    reserved name "index" is only ever used for generated directory listings,
+    never for a crawled page — see compute_output_path / generate_indexes.
+    """
     parsed_path = urlparse(url).path
     path = parsed_path.strip("/")
     if not path:
-        return "index"
-    if parsed_path.endswith("/"):
-        return path + "/index"
+        return "_root"
     return path
 
 
@@ -278,24 +282,14 @@ def fetch_sitemap_urls(entry_url: str, scope: tuple[str, str]) -> list[str] | No
 
 def compute_output_path(url: str, all_urls: list[str]) -> str:
     """
-    Like derive_page_path, but promotes a URL to <path>/index when it has
-    child pages in all_urls (i.e. it is both a page and a parent directory).
-    """
-    base_path = derive_page_path(url)
-    if base_path.endswith("/index"):
-        return base_path
+    Compute the on-disk page path under the OKF file-and-folder layout.
 
-    url_path = urlparse(url).path.rstrip("/") or "/"
-    has_children = any(
-        urlparse(other).path.startswith(url_path + "/")
-        for other in all_urls
-        if other != url
-    )
-    if not has_children:
-        return base_path
-    if base_path == "index":
-        return "index"
-    return base_path + "/index"
+    A page is always written as <path>.md, whether or not it has children.
+    A parent page (one that has child pages in all_urls) is written as
+    <path>.md and its children live under <path>/ — the filename "index.md"
+    is reserved for generated directory listings and is NEVER used for a page.
+    """
+    return derive_page_path(url)
 
 
 def raw_cache_dir(tool_name: str, base_dir: Path | None = None) -> Path:
@@ -353,6 +347,7 @@ def convert_from_cache(
     tool_name: str,
     base_dir: Path | None = None,
     manifest: dict | None = None,
+    type_: str = "Reference",
 ) -> Path | None:
     """Re-convert a cached Raw page to markdown without any network fetch."""
     if base_dir is None:
@@ -375,8 +370,18 @@ def convert_from_cache(
     make_images_absolute(content_soup, url)
     markdown_body = to_markdown(str(content_soup))
 
+    # Preserve any existing summary/keywords already written to the page so a
+    # re-conversion does not drop the LLM-generated description.
+    existing_fm = read_page_frontmatter(output_path) if output_path.exists() else {}
     frontmatter_text = build_frontmatter(
-        title, url, entry.get("fetched_at", ""), entry.get("content_hash", ""), nav_path=nav_path
+        title,
+        url,
+        entry.get("fetched_at", ""),
+        entry.get("content_hash", ""),
+        nav_path=nav_path,
+        type_=type_,
+        description=existing_fm.get("description"),
+        keywords=existing_fm.get("keywords"),
     )
     output_path.write_text(frontmatter_text + markdown_body, encoding="utf-8")
     return output_path
@@ -683,23 +688,49 @@ def make_images_absolute(soup: BeautifulSoup, base_url: str) -> None:
             tag["src"] = urljoin(base_url, src)
 
 
+def build_frontmatter_block(data: dict) -> str:
+    """Serialize an arbitrary mapping as a YAML frontmatter block (keys in order)."""
+    return (
+        "---\n"
+        + yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        + "---\n\n"
+    )
+
+
 def build_frontmatter(
     title: str,
     source_url: str,
     fetched_at: str,
     content_hash: str,
     nav_path: list[str] | None = None,
+    type_: str = "Reference",
+    description: str | None = None,
+    keywords: list[str] | None = None,
 ) -> str:
-    """Build YAML frontmatter block."""
-    data = {
-        "title": title,
-        "source_url": source_url,
-        "fetched_at": fetched_at,
-        "content_hash": content_hash,
-    }
+    """Build an OKF-conformant YAML frontmatter block.
+
+    Emits the required `type` field first, then maps crawler metadata onto OKF
+    field names: `resource` (the source URL) and `timestamp` (the fetch time).
+    `content_hash` and `nav_path` are producer-defined extension keys.
+    When summarized, the LLM abstract is written to `description` (with
+    `keywords`).
+    """
+    # Build with an explicit ordering so `type` is emitted first.
+    data: dict = {"type": type_, "title": title}
+    if description:
+        data["description"] = description
+    data["resource"] = source_url
+    data["timestamp"] = fetched_at
+    data["content_hash"] = content_hash
+    if keywords:
+        data["keywords"] = keywords
     if nav_path:
         data["nav_path"] = nav_path
-    return "---\n" + yaml.dump(data, default_flow_style=False, allow_unicode=True) + "---\n\n"
+    return (
+        "---\n"
+        + yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        + "---\n\n"
+    )
 
 
 def crawl_page(
@@ -710,6 +741,7 @@ def crawl_page(
     manifest: dict | None = None,
     force_render: bool = False,
     extra_headers: dict | None = None,
+    type_: str = "Reference",
 ) -> Path | None:
     """
     Fetch a single documentation page and write it as markdown.
@@ -812,7 +844,18 @@ def crawl_page(
     make_images_absolute(content_soup, url)
     markdown_body = to_markdown(str(content_soup))
 
-    frontmatter = build_frontmatter(title, url, fetched_at, content_hash, nav_path=nav_path)
+    # Preserve any existing summary/keywords from a prior summarize pass.
+    existing_fm = read_page_frontmatter(output_path) if output_path.exists() else {}
+    frontmatter = build_frontmatter(
+        title,
+        url,
+        fetched_at,
+        content_hash,
+        nav_path=nav_path,
+        type_=type_,
+        description=existing_fm.get("description"),
+        keywords=existing_fm.get("keywords"),
+    )
     output_path.write_text(frontmatter + markdown_body, encoding="utf-8")
     return output_path
 
@@ -828,13 +871,17 @@ def crawl_site(
     extra_headers: dict | None = None,
     fetch_delay: float = _FETCH_DELAY,
     errors: list | None = None,
+    type_: str = "Reference",
+    diff: dict | None = None,
 ) -> list[Path]:
     """
     Crawl all in-scope pages from entry_url and write each as markdown.
 
     Discovery uses sitemap.xml when present, BFS link-following otherwise.
     Crawl scope is auto-derived as same host + path prefix of entry_url.
-    Pages that are parents of other pages are written as <path>/index.md.
+    Under the OKF file-and-folder layout, a parent page is written as
+    <path>.md and its children live under <path>/; "index.md" is reserved
+    for generated directory listings.
 
     Args:
         convert_only: Rebuild markdown from the Raw-page cache without any network fetches.
@@ -843,6 +890,8 @@ def crawl_site(
         extra_headers: Additional request headers passed to every fetch (auth, cookies, etc.).
         fetch_delay: Seconds to sleep between page fetches (default: 1.0).
         errors: If provided, dicts with "url" and "error" are appended for each failed page.
+        diff: If provided, populated with {"created": [page_path...], "updated": [page_path...]}
+            distinguishing newly-discovered URLs from URLs whose content_hash changed.
 
     Returns:
         List of paths to written (or re-converted) markdown files.
@@ -856,11 +905,17 @@ def crawl_site(
         wipe_tool_data(tool_name, base_dir)
 
     manifest = load_manifest(tool_name, base_dir)
+    # Snapshot pre-crawl state so we can classify created vs updated Concepts.
+    prior_hashes = {
+        url: entry.get("content_hash") for url, entry in manifest.items()
+    }
 
     if convert_only:
         written = []
         for url, entry in manifest.items():
-            result = convert_from_cache(url, entry, tool_name, base_dir, manifest=manifest)
+            result = convert_from_cache(
+                url, entry, tool_name, base_dir, manifest=manifest, type_=type_
+            )
             if result is not None:
                 written.append(result)
         return written
@@ -881,10 +936,13 @@ def crawl_site(
         urls = raw_urls
 
     written = []
+    created: list[str] = []
+    updated: list[str] = []
     for i, url in enumerate(urls):
         if i > 0 and fetch_delay > 0:
             time.sleep(fetch_delay)
         path = compute_output_path(url, urls)
+        was_known = url in prior_hashes
         result = crawl_page(
             url,
             tool_name=tool_name,
@@ -893,13 +951,23 @@ def crawl_site(
             manifest=manifest,
             force_render=force_render,
             extra_headers=extra_headers,
+            type_=type_,
         )
         if result is not None:
             written.append(result)
+            page_path = manifest.get(url, {}).get("page_path", path)
+            if was_known:
+                updated.append(page_path)
+            else:
+                created.append(page_path)
         elif errors is not None:
             entry = manifest.get(url, {})
             if entry.get("status") == "errored":
                 errors.append({"url": url, "error": entry.get("error", "unknown")})
+
+    if diff is not None:
+        diff["created"] = created
+        diff["updated"] = updated
 
     save_manifest(manifest, tool_name, base_dir)
     return written
@@ -951,8 +1019,8 @@ def write_page_frontmatter(path: Path, updates: dict) -> None:
 
 
 def is_page_summarized(path: Path) -> bool:
-    """Return True if the page's frontmatter contains a non-empty summary."""
-    return bool(read_page_frontmatter(path).get("summary"))
+    """Return True if the page's frontmatter contains a non-empty description."""
+    return bool(read_page_frontmatter(path).get("description"))
 
 
 def _strip_code_fences(text: str) -> str:
@@ -1002,7 +1070,7 @@ def _summarize_batch(
     """Summarize a batch of pages by calling the LLM and writing results to frontmatter.
 
     Skips pages whose frontmatter content_hash matches the manifest (unchanged) and
-    that already have a non-empty summary. Returns candidates, done count, failed count.
+    that already have a non-empty description. Returns candidates, done count, failed count.
     """
     candidates: list[str] = []
     done = 0
@@ -1021,14 +1089,16 @@ def _summarize_batch(
             continue
 
         fm = read_page_frontmatter(md_path)
-        if fm.get("summary") and fm.get("content_hash") == entry.get("content_hash"):
+        if fm.get("description") and fm.get("content_hash") == entry.get("content_hash"):
             continue
 
         try:
             content = md_path.read_text(encoding="utf-8")
             result = call_summarize_llm(content, url)
+            # The LLM JSON uses "summary"/"keywords"; map summary → the OKF
+            # `description` frontmatter key.
             write_page_frontmatter(md_path, {
-                "summary": result["summary"],
+                "description": result["summary"],
                 "keywords": result["keywords"],
             })
             candidates.extend(result["candidates"])
@@ -1079,11 +1149,12 @@ def generate_glossary(
     candidates: list[str],
     base_dir: Path | None = None,
 ) -> Path:
-    """Write docs/tools/<tool>/CONTEXT.md from candidate terms.
+    """Write docs/tools/<tool>/glossary.md from candidate terms.
 
-    Deduplicates candidates (case-insensitive), calls the LLM to generate
-    canonical names and definitions, then writes the Glossary.
-    Marks the file <!-- auto-generated -->. Returns the path written.
+    The Glossary is an OKF Concept: it carries frontmatter with
+    `type: Glossary` and a title. Deduplicates candidates (case-insensitive),
+    calls the LLM to generate canonical names and definitions, then writes the
+    consolidated term list as the body. Returns the path written.
     """
     if base_dir is None:
         base_dir = Path(".")
@@ -1098,61 +1169,109 @@ def generate_glossary(
 
     entries = call_glossary_llm(unique, tool_name)
 
-    output_path = base_dir / "docs" / "tools" / tool_name / "CONTEXT.md"
+    output_path = base_dir / "docs" / "tools" / tool_name / "glossary.md"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    frontmatter = build_frontmatter_block(
+        {"type": "Glossary", "title": f"{tool_name} Glossary"}
+    )
     lines = [f"# {tool_name} Glossary", "", "<!-- auto-generated -->", ""]
     for entry in entries:
         lines.append(f"**{entry['term']}**: {entry['definition']}")
         lines.append("")
 
-    output_path.write_text("\n".join(lines), encoding="utf-8")
+    output_path.write_text(frontmatter + "\n".join(lines), encoding="utf-8")
     return output_path
 
 
-def generate_page_map(
+def _directory_title(rel_dir: str, tool_name: str) -> str:
+    """Human-readable heading for an index.md in directory `rel_dir` (relative to bundle root)."""
+    if rel_dir in ("", "."):
+        return tool_name
+    name = PurePosixPath(rel_dir).name
+    return name.replace("-", " ").replace("_", " ").title()
+
+
+def generate_indexes(
     tool_name: str,
     base_dir: Path | None = None,
     manifest: dict | None = None,
-) -> Path:
-    """Write docs/tools/<tool>/_index.md as a URL-path tree with summaries.
+) -> list[Path]:
+    """Write a reserved per-directory index.md into every directory of the bundle.
 
-    Reads each Page's frontmatter for its one-line summary, sorts by URL path,
-    and emits an indented list. Marks the file <!-- auto-generated -->.
-    Returns the path written.
+    Builds the directory tree in memory from the known page paths. Each
+    index.md lists that directory's immediate child Concepts (with their
+    `description` frontmatter, falling back to the title) and its immediate
+    subdirectories. The bundle-root index.md carries an `okf_version: "0.1"`
+    frontmatter block; nested index.md files have NO frontmatter. Returns the
+    list of index.md paths written.
     """
     if base_dir is None:
         base_dir = Path(".")
     if manifest is None:
         manifest = load_manifest(tool_name, base_dir)
 
-    entries: list[tuple[str, str, str]] = []
-    for url, entry in manifest.items():
+    bundle_root = base_dir / "docs" / "tools" / tool_name
+
+    # Map each directory (POSIX rel path, "" = root) to its immediate child
+    # concept files and child subdirectories.
+    child_files: dict[str, set[str]] = defaultdict(set)
+    subdirs: dict[str, set[str]] = defaultdict(set)
+    all_dirs: set[str] = {""}
+
+    for entry in manifest.values():
         page_path = entry.get("page_path", "")
-        md_path = base_dir / "docs" / "tools" / tool_name / (page_path + ".md")
-        summary = ""
+        if not page_path:
+            continue
+        parts = page_path.split("/")
+        # Register every ancestor directory.
+        for i in range(len(parts)):
+            parent = "/".join(parts[:i])
+            all_dirs.add(parent)
+            if i < len(parts) - 1:
+                child = "/".join(parts[: i + 1])
+                subdirs[parent].add(child)
+        parent_dir = "/".join(parts[:-1])
+        child_files[parent_dir].add(page_path)
+
+    def description_for(page_path: str) -> tuple[str, str]:
+        """Return (title, description) for a concept page from its frontmatter."""
+        md_path = bundle_root / (page_path + ".md")
+        title = PurePosixPath(page_path).name
+        description = ""
         if md_path.exists():
             fm = read_page_frontmatter(md_path)
-            summary = fm.get("summary", "")
-        url_path = urlparse(url).path or "/"
-        entries.append((url_path, page_path, summary))
+            title = fm.get("title") or title
+            description = fm.get("description") or ""
+        return title, description
 
-    entries.sort(key=lambda e: e[0])
+    written: list[Path] = []
+    for rel_dir in sorted(all_dirs):
+        dir_path = bundle_root if rel_dir == "" else bundle_root / rel_dir
+        dir_path.mkdir(parents=True, exist_ok=True)
 
-    lines = [f"# {tool_name} — Page Map", "", "<!-- auto-generated -->", ""]
-    for url_path, page_path, summary in entries:
-        depth = max(0, url_path.rstrip("/").count("/") - 1)
-        indent = "  " * depth
-        rel_link = f"{page_path}.md"
-        if summary:
-            lines.append(f"{indent}- [{url_path}]({rel_link}) — {summary}")
-        else:
-            lines.append(f"{indent}- [{url_path}]({rel_link})")
+        lines = [f"# {_directory_title(rel_dir, tool_name)}", ""]
 
-    output_path = base_dir / "docs" / "tools" / tool_name / "_index.md"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return output_path
+        for page_path in sorted(child_files.get(rel_dir, ())):
+            name = PurePosixPath(page_path).name
+            title, description = description_for(page_path)
+            suffix = f" - {description}" if description else " - "
+            lines.append(f"- [{title}](./{name}.md){suffix}")
+
+        for sub in sorted(subdirs.get(rel_dir, ())):
+            name = PurePosixPath(sub).name
+            label = _directory_title(sub, tool_name)
+            lines.append(f"- [{label}](./{name}/) - ")
+
+        body = "\n".join(lines) + "\n"
+        if rel_dir == "":
+            body = build_frontmatter_block({"okf_version": "0.1"}) + body
+
+        index_path = dir_path / "index.md"
+        index_path.write_text(body, encoding="utf-8")
+        written.append(index_path)
+
+    return written
 
 
 def update_tools_map(
@@ -1160,26 +1279,27 @@ def update_tools_map(
     entry_url: str,
     base_dir: Path | None = None,
 ) -> Path:
-    """Idempotently update docs/tools/CONTEXT-MAP.md with this Tool's entry.
+    """Idempotently update docs/tools/index.md with this Tool's entry.
 
-    Creates the file if absent. Replaces an existing entry for tool_name
-    (matched by leading '- **{tool_name}**') or appends a new one.
-    Returns the path written.
+    This is the reserved listing for the tools collection (NO frontmatter):
+    one entry per Tool linking to its bundle directory. Creates the file if
+    absent. Replaces an existing entry for tool_name (matched by leading
+    '- [{tool_name}]') or appends a new one. Returns the path written.
     """
     if base_dir is None:
         base_dir = Path(".")
 
-    output_path = base_dir / "docs" / "tools" / "CONTEXT-MAP.md"
+    output_path = base_dir / "docs" / "tools" / "index.md"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if output_path.exists():
         content = output_path.read_text(encoding="utf-8")
     else:
-        content = "# Tools Map\n\n<!-- auto-generated -->\n"
+        content = "# Tools\n"
 
     tool_dir = f"{tool_name}/"
-    entry_line = f"- **{tool_name}** — [{tool_dir}]({tool_dir})"
-    tool_marker = f"- **{tool_name}**"
+    entry_line = f"- [{tool_name}](./{tool_dir}) - {entry_url}"
+    tool_marker = f"- [{tool_name}]"
 
     lines = content.splitlines()
     new_lines: list[str] = []
@@ -1198,28 +1318,135 @@ def update_tools_map(
     return output_path
 
 
+def _concept_label(page_path: str, base_dir: Path, tool_name: str) -> str:
+    """Markdown link + title for a concept page, used in the log."""
+    md_path = base_dir / "docs" / "tools" / tool_name / (page_path + ".md")
+    title = PurePosixPath(page_path).name
+    if md_path.exists():
+        fm = read_page_frontmatter(md_path)
+        title = fm.get("title") or title
+    return f"[{title}](./{page_path}.md)"
+
+
+def generate_log(
+    tool_name: str,
+    created: list[str],
+    updated: list[str],
+    base_dir: Path | None = None,
+    today: str | None = None,
+) -> Path:
+    """Write/merge docs/tools/<tool>/log.md change history (newest first, NO frontmatter).
+
+    `created` and `updated` are lists of page paths for newly-added and
+    content-changed Concepts respectively. Ensures a `## <YYYY-MM-DD>` section
+    for today exists with `**Creation**:` / `**Update**:` entries, merging into
+    an existing section for today rather than duplicating it.
+    """
+    if base_dir is None:
+        base_dir = Path(".")
+    if today is None:
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+
+    output_path = base_dir / "docs" / "tools" / tool_name / "log.md"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    new_entries: list[str] = []
+    for pp in created:
+        new_entries.append(f"- **Creation**: {_concept_label(pp, base_dir, tool_name)}")
+    for pp in updated:
+        new_entries.append(f"- **Update**: {_concept_label(pp, base_dir, tool_name)}")
+
+    heading = f"## {today}"
+
+    if not output_path.exists():
+        lines = ["# Update Log", ""]
+        if new_entries:
+            lines.append(heading)
+            lines.extend(new_entries)
+            lines.append("")
+        output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return output_path
+
+    if not new_entries:
+        return output_path
+
+    # Parse existing sections so we can merge today's without duplicating.
+    text = output_path.read_text(encoding="utf-8")
+    body_lines = text.splitlines()
+
+    # Split into a preamble (title) and dated sections.
+    sections: list[tuple[str, list[str]]] = []
+    preamble: list[str] = []
+    current_head: str | None = None
+    current_body: list[str] = []
+    for line in body_lines:
+        if line.startswith("## "):
+            if current_head is not None:
+                sections.append((current_head, current_body))
+            current_head = line
+            current_body = []
+        elif current_head is None:
+            preamble.append(line)
+        else:
+            current_body.append(line)
+    if current_head is not None:
+        sections.append((current_head, current_body))
+
+    # Merge into today's section if present (dedup by line), else prepend it.
+    merged = False
+    for i, (head, sec_body) in enumerate(sections):
+        if head == heading:
+            existing = {ln.strip() for ln in sec_body if ln.strip()}
+            additions = [e for e in new_entries if e not in existing]
+            kept = [ln for ln in sec_body if ln.strip()]
+            sections[i] = (head, kept + additions + [""])
+            merged = True
+            break
+    if not merged:
+        sections.insert(0, (heading, new_entries + [""]))
+
+    out: list[str] = []
+    if preamble:
+        # Drop trailing blank lines from preamble, then re-add a single spacer.
+        while preamble and not preamble[-1].strip():
+            preamble.pop()
+        out.extend(preamble)
+        out.append("")
+    for head, sec_body in sections:
+        out.append(head)
+        out.extend([ln for ln in sec_body if ln.strip()])
+        out.append("")
+
+    output_path.write_text("\n".join(out).rstrip("\n") + "\n", encoding="utf-8")
+    return output_path
+
+
 def synthesize_site(
     tool_name: str,
     candidates: list[str],
     entry_url: str,
     base_dir: Path | None = None,
     manifest: dict | None = None,
+    created: list[str] | None = None,
+    updated: list[str] | None = None,
 ) -> dict:
-    """Post-summarization synthesis: glossary, page map, and tools map.
+    """Post-summarization synthesis: glossary, per-directory indexes, tools map, log.
 
-    Returns {"glossary_path": Path, "page_map_path": Path, "tools_map_path": Path}.
+    Returns {"glossary_path", "index_paths", "tools_map_path", "log_path"}.
     """
     if base_dir is None:
         base_dir = Path(".")
 
     glossary_path = generate_glossary(tool_name, candidates, base_dir)
-    page_map_path = generate_page_map(tool_name, base_dir, manifest)
+    index_paths = generate_indexes(tool_name, base_dir, manifest)
     tools_map_path = update_tools_map(tool_name, entry_url, base_dir)
+    log_path = generate_log(tool_name, created or [], updated or [], base_dir)
 
     return {
         "glossary_path": glossary_path,
-        "page_map_path": page_map_path,
+        "index_paths": index_paths,
         "tools_map_path": tools_map_path,
+        "log_path": log_path,
     }
 
 
@@ -1262,6 +1489,30 @@ def summarize_site(
             total_failed += result["failed"]
 
     return {"candidates": all_candidates, "done": total_done, "failed": total_failed}
+
+
+def validate_bundle(bundle_dir: Path, base_dir: Path | None = None) -> int | None:
+    """Run the vendored OKF validator against a bundle directory.
+
+    Locates scripts/validate.sh next to this module, runs it on `bundle_dir`,
+    streams its output, and returns the validator's exit code. Returns None
+    (and prints a warning) if the validator script is missing — never crashes.
+    """
+    validator = Path(__file__).resolve().parent / "scripts" / "validate.sh"
+    if not validator.exists():
+        print(f"Warning: validator not found at {validator}; skipping validation.", flush=True)
+        return None
+
+    result = subprocess.run(
+        ["bash", str(validator), str(bundle_dir)],
+        capture_output=True,
+        text=True,
+    )
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+    if result.stderr:
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", flush=True)
+    return result.returncode
 
 
 def main() -> None:
@@ -1315,7 +1566,18 @@ def main() -> None:
     parser.add_argument(
         "--synthesize",
         action="store_true",
-        help="Generate glossary, page map, and tools map after crawling/summarizing",
+        help="Generate glossary, indexes, tools map, and log after crawling/summarizing",
+    )
+    parser.add_argument(
+        "--type",
+        default="Reference",
+        metavar="TYPE",
+        help='OKF `type` field written to each page frontmatter (default: "Reference")',
+    )
+    parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="Skip running the OKF validator on each written bundle",
     )
     args = parser.parse_args()
 
@@ -1338,51 +1600,71 @@ def main() -> None:
             tool_name=args.tool_name,
             force_render=args.render,
             extra_headers=extra_headers or None,
+            type_=args.type,
         )
         if result:
             print(f"Written: {result}")
         else:
             print("Skipped (unchanged)")
-    else:
-        errors: list = []
-        paths = crawl_site(
-            args.url,
-            tool_name=args.tool_name,
-            convert_only=args.convert_only,
-            fresh=args.fresh,
-            force_render=args.render,
-            safe_mode=args.safe_mode,
-            extra_headers=extra_headers or None,
-            fetch_delay=args.delay,
-            errors=errors,
+        return
+
+    tool = args.tool_name or derive_tool_name(args.url)
+    errors: list = []
+    diff: dict = {}
+    paths = crawl_site(
+        args.url,
+        tool_name=args.tool_name,
+        convert_only=args.convert_only,
+        fresh=args.fresh,
+        force_render=args.render,
+        safe_mode=args.safe_mode,
+        extra_headers=extra_headers or None,
+        fetch_delay=args.delay,
+        errors=errors,
+        type_=args.type,
+        diff=diff,
+    )
+    for p in paths:
+        print(f"Written: {p}")
+    if errors:
+        print(f"\nFailed pages ({len(errors)}):")
+        for err in errors:
+            print(f"  {err['url']}: {err['error']}")
+
+    candidates: list[str] = []
+    if args.summarize:
+        tally = summarize_site(
+            tool,
+            concurrency=args.summarize_concurrency,
+            batch_size=args.summarize_batch_size,
         )
-        for p in paths:
-            print(f"Written: {p}")
-        if errors:
-            print(f"\nFailed pages ({len(errors)}):")
-            for err in errors:
-                print(f"  {err['url']}: {err['error']}")
+        candidates = tally["candidates"]
+        print(f"\nSummarized {tally['done']} pages ({tally['failed']} failed).")
+        if candidates:
+            print(f"Candidate terms: {', '.join(sorted(set(candidates))[:20])}")
 
-        candidates: list[str] = []
-        if args.summarize or args.synthesize:
-            tool = args.tool_name or derive_tool_name(args.url)
+    # Synthesis builds the reserved OKF files (per-directory index.md, glossary,
+    # tools map, log) so the bundle is structurally valid. Always run it after a
+    # crawl/convert; the glossary LLM call is a no-op when there are no candidates.
+    synthesis = synthesize_site(
+        tool,
+        candidates,
+        args.url,
+        created=diff.get("created"),
+        updated=diff.get("updated"),
+    )
+    print(f"Glossary:  {synthesis['glossary_path']}")
+    print(f"Indexes:   {len(synthesis['index_paths'])} index.md files")
+    print(f"Tools map: {synthesis['tools_map_path']}")
+    print(f"Log:       {synthesis['log_path']}")
 
-            if args.summarize:
-                tally = summarize_site(
-                    tool,
-                    concurrency=args.summarize_concurrency,
-                    batch_size=args.summarize_batch_size,
-                )
-                candidates = tally["candidates"]
-                print(f"\nSummarized {tally['done']} pages ({tally['failed']} failed).")
-                if candidates:
-                    print(f"Candidate terms: {', '.join(sorted(set(candidates))[:20])}")
-
-            if args.synthesize:
-                synthesis = synthesize_site(tool, candidates, args.url)
-                print(f"Glossary:  {synthesis['glossary_path']}")
-                print(f"Page map:  {synthesis['page_map_path']}")
-                print(f"Tools map: {synthesis['tools_map_path']}")
+    # Validate each bundle written this run; exit non-zero if any fail.
+    if not args.no_validate:
+        bundle_dir = Path(".") / "docs" / "tools" / tool
+        print(f"\nValidating bundle: {bundle_dir}")
+        code = validate_bundle(bundle_dir)
+        if code is not None and code != 0:
+            sys.exit(code)
 
 
 if __name__ == "__main__":
