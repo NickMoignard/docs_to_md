@@ -234,13 +234,24 @@ def ensure_playwright_chromium() -> None:
 
 
 def fetch_with_playwright(url: str) -> str:
-    """Fetch a page's fully-rendered HTML via headless Chromium."""
-    from playwright.sync_api import sync_playwright
+    """Fetch a page's fully-rendered HTML via headless Chromium.
+
+    Waits for `networkidle` so client-rendered (SPA) content has settled, but
+    falls back to the `domcontentloaded` state when the network never goes idle
+    (long-lived analytics/websocket/polling connections keep it busy forever).
+    Without the fallback a single such page raises TimeoutError and, since the
+    caller has no guard, aborts the entire crawl.
+    """
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
             page = browser.new_page(extra_http_headers=_HEADERS)
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            try:
+                page.goto(url, wait_until="networkidle", timeout=30000)
+            except PlaywrightTimeoutError:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
             html = page.content()
         finally:
             browser.close()
@@ -909,7 +920,12 @@ def crawl_page(
 
     if force_render:
         ensure_playwright_chromium()
-        html = fetch_with_playwright(url)
+        try:
+            html = fetch_with_playwright(url)
+        except Exception as exc:
+            if manifest is not None:
+                manifest[url] = {"page_path": page_path, "status": "errored", "error": str(exc)}
+            return None
         etag = None
         last_modified = None
     else:
@@ -954,7 +970,12 @@ def crawl_page(
 
     if not force_render and is_content_below_threshold(markdown_body):
         ensure_playwright_chromium()
-        html = fetch_with_playwright(url)
+        try:
+            html = fetch_with_playwright(url)
+        except Exception as exc:
+            if manifest is not None:
+                manifest[url] = {"page_path": page_path, "status": "errored", "error": str(exc)}
+            return None
         content_hash = hashlib.sha256(html.encode()).hexdigest()
         title, content_html = extract_content(html)
         markdown_body = to_markdown(content_html)
@@ -1190,6 +1211,52 @@ def _strip_code_fences(text: str) -> str:
     return text
 
 
+def _parse_json_array_tolerant(text: str) -> list:
+    """Parse a JSON array of objects, salvaging entries from malformed output.
+
+    LLM glossary output can arrive truncated (hit max_tokens) or with a trailing
+    comma. A strict json.loads throws on the whole payload and loses every entry.
+    Try strict first; on failure, extract each complete top-level {...} object and
+    parse it individually, discarding any incomplete trailing object.
+    """
+    try:
+        result = json.loads(text)
+        return result if isinstance(result, list) else []
+    except json.JSONDecodeError:
+        pass
+
+    entries: list = []
+    depth = 0
+    start = -1
+    in_str = False
+    escape = False
+    for i, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    entries.append(json.loads(text[start : i + 1]))
+                except json.JSONDecodeError:
+                    pass
+                start = -1
+    return entries
+
+
 def call_summarize_llm(content: str, url: str) -> dict:
     """Call Claude to generate a summary, keywords, and candidate terms for a page.
 
@@ -1303,16 +1370,52 @@ def call_glossary_llm(terms: list[str], tool_name: str) -> list[dict]:
     )
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     )
     text = _strip_code_fences(response.content[0].text.strip())
-    parsed = json.loads(text.strip())
+    parsed = _parse_json_array_tolerant(text.strip())
     return [
         {"term": str(e.get("term", "")), "definition": str(e.get("definition", ""))}
         for e in parsed
-        if e.get("term") and e.get("definition")
+        if isinstance(e, dict) and e.get("term") and e.get("definition")
     ]
+
+
+def _glossary_has_entries(path: Path) -> bool:
+    """Return True if an existing glossary.md already holds at least one term."""
+    if not path.exists():
+        return False
+    return any(line.startswith("**") for line in path.read_text(encoding="utf-8").splitlines())
+
+
+def gather_frontmatter_keywords(
+    tool_name: str,
+    base_dir: Path | None = None,
+) -> list[str]:
+    """Collect `keywords` from every Page's frontmatter under a Tool's bundle.
+
+    Used as a fallback source of glossary candidate terms when a summarize pass
+    re-processed no pages (everything cached) or wasn't run at all (a bare,
+    incremental crawl), so no in-memory candidates exist. Skips the reserved
+    navigation files (index/glossary/log).
+    """
+    if base_dir is None:
+        base_dir = Path(".")
+    tool_dir = base_dir / "docs" / "tools" / tool_name
+    if not tool_dir.exists():
+        return []
+
+    reserved = {"index.md", "glossary.md", "log.md"}
+    terms: list[str] = []
+    for md_path in sorted(tool_dir.rglob("*.md")):
+        if md_path.name in reserved:
+            continue
+        fm = read_page_frontmatter(md_path)
+        kws = fm.get("keywords")
+        if isinstance(kws, list):
+            terms.extend(str(k).strip() for k in kws if str(k).strip())
+    return terms
 
 
 def generate_glossary(
@@ -1326,9 +1429,17 @@ def generate_glossary(
     `type: Glossary` and a title. Deduplicates candidates (case-insensitive),
     calls the LLM to generate canonical names and definitions, then writes the
     consolidated term list as the body. Returns the path written.
+
+    Non-destructive: if no entries can be produced (no candidates, missing
+    ANTHROPIC_API_KEY, or an API error) but a populated glossary already exists
+    on disk, the existing file is left untouched rather than clobbered with an
+    empty stub — so a bare/incremental re-crawl never wipes a glossary built by
+    an earlier summarized run.
     """
     if base_dir is None:
         base_dir = Path(".")
+
+    output_path = base_dir / "docs" / "tools" / tool_name / "glossary.md"
 
     seen: set[str] = set()
     unique: list[str] = []
@@ -1338,9 +1449,15 @@ def generate_glossary(
             seen.add(key)
             unique.append(term.strip())
 
-    entries = call_glossary_llm(unique, tool_name)
+    try:
+        entries = call_glossary_llm(unique, tool_name)
+    except Exception as exc:
+        print(f"Warning: glossary generation skipped ({exc}).", flush=True)
+        entries = []
 
-    output_path = base_dir / "docs" / "tools" / tool_name / "glossary.md"
+    if not entries and _glossary_has_entries(output_path):
+        return output_path
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     frontmatter = build_frontmatter_block(
@@ -1828,12 +1945,21 @@ def main() -> None:
         )
         candidates = tally["candidates"]
         print(f"\nSummarized {tally['done']} pages ({tally['failed']} failed).")
-        if candidates:
-            print(f"Candidate terms: {', '.join(sorted(set(candidates))[:20])}")
+
+    # candidates are collected in-memory only during a live summarize pass; on a
+    # fully-cached re-run nothing is re-summarized, and a bare/incremental crawl
+    # never summarizes at all. In both cases fall back to the keywords already
+    # persisted in each page's frontmatter so synthesis can still (re)build the
+    # glossary instead of overwriting it with an empty stub.
+    if not candidates:
+        candidates = gather_frontmatter_keywords(tool)
+    if candidates:
+        print(f"Candidate terms: {', '.join(sorted(set(candidates))[:20])}")
 
     # Synthesis builds the reserved OKF files (per-directory index.md, glossary,
     # tools map, log) so the bundle is structurally valid. Always run it after a
-    # crawl/convert; the glossary LLM call is a no-op when there are no candidates.
+    # crawl/convert; glossary regeneration is non-destructive (it preserves an
+    # existing populated glossary when no entries can be produced).
     progress.banner("Synthesizing navigation layer…")
     synthesis = synthesize_site(
         tool,
