@@ -19,6 +19,7 @@ from crawl import (
     _CONTENT_THRESHOLD,
     Progress,
     _fetch_with_retry,
+    _parse_json_array_tolerant,
     _summarize_batch,
     batch_pages_by_directory,
     build_frontmatter,
@@ -39,6 +40,7 @@ from crawl import (
     fetch_robots,
     fetch_sitemap_urls,
     fetch_with_playwright,
+    gather_frontmatter_keywords,
     generate_glossary,
     generate_indexes,
     generate_log,
@@ -1462,6 +1464,32 @@ class TestFetchWithPlaywright:
 
         mock_browser.close.assert_called_once()
 
+    def test_falls_back_to_domcontentloaded_on_networkidle_timeout(self):
+        # Regression for #13 Bug 2: a page whose network never goes idle must not
+        # abort the crawl — fall back to the domcontentloaded state instead.
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        rendered_html = "<html><body><main><p>Rendered</p></main></body></html>"
+        with patch("playwright.sync_api.sync_playwright") as mock_pw:
+            mock_ctx = MagicMock()
+            mock_pw.return_value.__enter__ = MagicMock(return_value=mock_ctx)
+            mock_pw.return_value.__exit__ = MagicMock(return_value=False)
+            mock_browser = MagicMock()
+            mock_page = MagicMock()
+            mock_page.content.return_value = rendered_html
+            # First goto (networkidle) times out; second (domcontentloaded) succeeds.
+            mock_page.goto.side_effect = [PlaywrightTimeoutError("networkidle timeout"), None]
+            mock_browser.new_page.return_value = mock_page
+            mock_ctx.chromium.launch.return_value = mock_browser
+
+            result = fetch_with_playwright("https://spa.example.com/page")
+
+        assert result == rendered_html
+        assert mock_page.goto.call_count == 2
+        # Second call must use the more forgiving wait state.
+        assert mock_page.goto.call_args_list[1].kwargs.get("wait_until") == "domcontentloaded"
+        mock_browser.close.assert_called_once()
+
 
 class TestCrawlPagePlaywrightFallback:
     SPARSE_HTML = """<!DOCTYPE html>
@@ -1516,6 +1544,19 @@ class TestCrawlPagePlaywrightFallback:
             result = crawl_page("https://docs.example.com/page", base_dir=tmp_path)
         text = result.read_text()
         assert "Rich page" in text
+
+    def test_render_failure_records_errored_status_not_crash(self, tmp_path):
+        # Regression for #13 Bug 2: a render error in the fallback path must record
+        # an errored manifest entry and return None, not propagate and abort the crawl.
+        manifest = {}
+        with patch("crawl.requests.get", return_value=self._mock_static(self.SPARSE_HTML)), \
+             patch("crawl.fetch_with_playwright", side_effect=RuntimeError("render boom")), \
+             patch("crawl.ensure_playwright_chromium"):
+            result = crawl_page(
+                "https://docs.example.com/page", base_dir=tmp_path, manifest=manifest
+            )
+        assert result is None
+        assert manifest["https://docs.example.com/page"]["status"] == "errored"
 
 
 class TestCrawlSiteForceRender:
@@ -2428,6 +2469,94 @@ class TestGenerateGlossary:
             mock_llm.return_value = []
             generate_glossary("stripe", [], tmp_path)
         mock_llm.assert_called_once_with([], "stripe")
+
+    def test_preserves_existing_glossary_when_no_entries(self, tmp_path):
+        # Regression for #27: a bare/incremental crawl (no candidates) must not
+        # clobber a populated glossary built by an earlier summarized run.
+        with patch("crawl.call_glossary_llm", return_value=[{"term": "Charge", "definition": "A debit."}]):
+            path = generate_glossary("stripe", ["charge"], tmp_path)
+        populated = path.read_text()
+        assert "**Charge**" in populated
+
+        with patch("crawl.call_glossary_llm", return_value=[]):
+            again = generate_glossary("stripe", [], tmp_path)
+        assert again.read_text() == populated
+
+    def test_preserves_existing_glossary_when_llm_raises(self, tmp_path):
+        # Regression for #27: a missing ANTHROPIC_API_KEY makes anthropic.Anthropic()
+        # raise; the run must not crash and the existing glossary must survive.
+        with patch("crawl.call_glossary_llm", return_value=[{"term": "Charge", "definition": "A debit."}]):
+            path = generate_glossary("stripe", ["charge"], tmp_path)
+        populated = path.read_text()
+
+        with patch("crawl.call_glossary_llm", side_effect=TypeError("Could not resolve authentication method")):
+            again = generate_glossary("stripe", ["charge"], tmp_path)
+        assert again.read_text() == populated
+
+    def test_writes_stub_when_no_entries_and_no_existing_glossary(self, tmp_path):
+        # First-ever bare crawl: nothing to preserve, so a valid stub is fine.
+        with patch("crawl.call_glossary_llm", return_value=[]):
+            path = generate_glossary("stripe", [], tmp_path)
+        assert path.exists()
+        assert "type: Glossary" in path.read_text()
+
+
+class TestParseJsonArrayTolerant:
+    def test_parses_well_formed_array(self):
+        text = '[{"term": "A", "definition": "x"}, {"term": "B", "definition": "y"}]'
+        assert _parse_json_array_tolerant(text) == [
+            {"term": "A", "definition": "x"},
+            {"term": "B", "definition": "y"},
+        ]
+
+    def test_salvages_truncated_array(self):
+        # Regression for #21 Bug 1: response cut off mid-element (hit max_tokens).
+        text = '[{"term": "A", "definition": "x"}, {"term": "B", "definition": "y"}, {"term": "C", "defini'
+        result = _parse_json_array_tolerant(text)
+        assert {"term": "A", "definition": "x"} in result
+        assert {"term": "B", "definition": "y"} in result
+        assert len(result) == 2
+
+    def test_salvages_trailing_comma(self):
+        text = '[{"term": "A", "definition": "x"}, {"term": "B", "definition": "y"},]'
+        result = _parse_json_array_tolerant(text)
+        assert len(result) == 2
+
+    def test_ignores_braces_inside_strings(self):
+        text = '[{"term": "A", "definition": "uses {curly} braces"}]'
+        assert _parse_json_array_tolerant(text) == [{"term": "A", "definition": "uses {curly} braces"}]
+
+    def test_returns_empty_for_garbage(self):
+        assert _parse_json_array_tolerant("not json at all") == []
+
+
+class TestGatherFrontmatterKeywords:
+    def _make_page(self, tmp_path, tool, page_path, keywords=None):
+        md_path = tmp_path / "docs" / "tools" / tool / (page_path + ".md")
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        fm = {"type": "Reference", "title": "T", "content_hash": "h"}
+        if keywords is not None:
+            fm["keywords"] = keywords
+        md_path.write_text("---\n" + yaml.dump(fm) + "---\n\n# T\n", encoding="utf-8")
+        return md_path
+
+    def test_collects_keywords_across_pages(self, tmp_path):
+        self._make_page(tmp_path, "stripe", "charges", keywords=["Charge", "Capture"])
+        self._make_page(tmp_path, "stripe", "refunds", keywords=["Refund"])
+        result = gather_frontmatter_keywords("stripe", tmp_path)
+        assert set(result) == {"Charge", "Capture", "Refund"}
+
+    def test_skips_reserved_navigation_files(self, tmp_path):
+        self._make_page(tmp_path, "stripe", "charges", keywords=["Charge"])
+        # glossary.md is reserved and must not contribute candidate terms
+        (tmp_path / "docs" / "tools" / "stripe" / "glossary.md").write_text(
+            "---\ntype: Glossary\nkeywords:\n- Bogus\n---\n", encoding="utf-8"
+        )
+        result = gather_frontmatter_keywords("stripe", tmp_path)
+        assert result == ["Charge"]
+
+    def test_returns_empty_when_tool_dir_absent(self, tmp_path):
+        assert gather_frontmatter_keywords("missing", tmp_path) == []
 
 
 class TestGenerateIndexes:
